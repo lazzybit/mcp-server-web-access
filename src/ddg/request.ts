@@ -44,7 +44,7 @@ export interface PageRequest {
   endpoint: string;
   /** Form body to POST. */
   form: URLSearchParams;
-  /** Relative deadline for this single request (headers + body). */
+  /** Relative timeout for this single request (headers + body). */
   deadlineMs: number;
   signal?: AbortSignal;
   fetchImpl?: FetchLike;
@@ -90,7 +90,8 @@ export function buildPageForm(
  *
  * Guarantees:
  * - an already-aborted signal returns `ABORTED` without touching the network;
- * - the timeout covers connect, headers and the streamed body;
+ * - the timeout covers connect, headers and the streamed body, and races the
+ *   whole operation so a fetch/body that ignores the abort cannot hang it;
  * - the body is capped at `maxBodyBytes` and cancelled when exceeded;
  * - the timer and abort listener are always released.
  */
@@ -104,7 +105,6 @@ export async function requestPage(request: PageRequest): Promise<PageResponse> {
   const maxBodyBytes = request.maxBodyBytes ?? MAX_BODY_BYTES;
   const externalSignal = request.signal;
   const controller = new AbortController();
-  let timedOut = false;
   let abortedByCaller = externalSignal?.aborted ?? false;
 
   const onExternalAbort = (): void => {
@@ -113,19 +113,48 @@ export async function requestPage(request: PageRequest): Promise<PageResponse> {
   };
   externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
 
-  const timer = schedule(() => {
-    timedOut = true;
-    controller.abort(new DOMException("request deadline exceeded", "TimeoutError"));
-  }, Math.max(0, request.deadlineMs));
+  const timerRef: { handle: TimerHandle | null } = { handle: null };
+  const timeout = new Promise<PageResponse>((resolve) => {
+    timerRef.handle = schedule(() => {
+      controller.abort(new DOMException("request deadline exceeded", "TimeoutError"));
+      resolve({
+        kind: "failure",
+        code: "TIMEOUT",
+        message: `request exceeded ${request.deadlineMs}ms deadline`,
+      });
+    }, Math.max(0, request.deadlineMs));
+  });
 
+  const work = readResponse(request, fetchImpl, controller.signal, maxBodyBytes, () =>
+    abortedByCaller,
+  );
+  // The loser of the race may still settle later; never surface an unhandled
+  // rejection.
+  work.catch(() => undefined);
+
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    timerRef.handle?.cancel();
+    externalSignal?.removeEventListener("abort", onExternalAbort);
+  }
+}
+
+async function readResponse(
+  request: PageRequest,
+  fetchImpl: FetchLike,
+  signal: AbortSignal,
+  maxBodyBytes: number,
+  wasAbortedByCaller: () => boolean,
+): Promise<PageResponse> {
   try {
     const response = await fetchImpl(request.endpoint, {
       method: "POST",
       headers: APP_HEADERS,
       body: request.form.toString(),
-      signal: controller.signal,
+      signal,
     });
-    const read = await readBodyCapped(response, maxBodyBytes);
+    const read = await readBodyCapped(response, maxBodyBytes, signal);
     if (read === TOO_LARGE) {
       return {
         kind: "failure",
@@ -135,25 +164,14 @@ export async function requestPage(request: PageRequest): Promise<PageResponse> {
     }
     return { kind: "http", status: response.status, bytes: read };
   } catch (error) {
-    // Caller/job-deadline cancellation takes precedence over the attempt timer.
-    if (abortedByCaller || externalSignal?.aborted === true) {
+    if (wasAbortedByCaller()) {
       return { kind: "failure", code: "ABORTED", message: "request aborted by caller" };
-    }
-    if (timedOut) {
-      return {
-        kind: "failure",
-        code: "TIMEOUT",
-        message: `request exceeded ${request.deadlineMs}ms deadline`,
-      };
     }
     return {
       kind: "failure",
       code: "NETWORK",
       message: error instanceof Error ? error.message : String(error),
     };
-  } finally {
-    timer.cancel();
-    externalSignal?.removeEventListener("abort", onExternalAbort);
   }
 }
 
@@ -162,14 +180,24 @@ const TOO_LARGE = Symbol("too-large");
 async function readBodyCapped(
   response: Response,
   maxBodyBytes: number,
+  signal: AbortSignal,
 ): Promise<Uint8Array | typeof TOO_LARGE> {
   const body = response.body;
   if (body === null) return new Uint8Array(0);
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // Bounded body cleanup: a timeout/abort must not leave a pending read
+  // holding the stream open. Fire-and-forget; the read settles either way.
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
   try {
     for (;;) {
+      if (signal.aborted) {
+        throw new DOMException("request aborted", "AbortError");
+      }
       const { done, value } = await reader.read();
       if (done) break;
       if (value === undefined) continue;
@@ -181,6 +209,7 @@ async function readBodyCapped(
       chunks.push(value);
     }
   } finally {
+    signal.removeEventListener("abort", onAbort);
     try {
       reader.releaseLock();
     } catch {

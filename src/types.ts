@@ -10,13 +10,6 @@ export interface SearchParams {
   freshness?: Freshness;
 }
 
-/** One complete search: parameters plus the absolute RPC deadline. */
-export interface SearchRequest {
-  params: SearchParams;
-  /** Absolute time (ms epoch). Set by the Worker before the RPC call. */
-  deadlineAt: number;
-}
-
 /** A single organic result. */
 export interface SearchResultItem {
   rank: number;
@@ -26,6 +19,11 @@ export interface SearchResultItem {
   snippet: string | null;
 }
 
+/**
+ * Error codes kept for wire compatibility. `TIMEOUT` and `ABORTED` are no
+ * longer emitted by `search_ddg`: per-operation timeouts surface as
+ * `UPSTREAM_ERROR`, and there is no whole-call deadline or caller cancellation.
+ */
 export type ErrorCode =
   | "INVALID_INPUT"
   | "TIMEOUT"

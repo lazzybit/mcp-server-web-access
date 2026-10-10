@@ -97,7 +97,7 @@ describe("requestPage", () => {
     expect(response.code).toBe("TOO_LARGE");
   });
 
-  it("reports a timeout when the deadline elapses", async () => {
+  it("reports a TIMEOUT when the attempt timeout elapses", async () => {
     const clock = new ManualClock();
     const promise = requestPage({
       endpoint: "https://example.com/html/",
@@ -110,6 +110,44 @@ describe("requestPage", () => {
             reject(new DOMException("aborted", "AbortError"));
           });
         }),
+    });
+    await clock.advance(20);
+    const response = await promise;
+    expect(response.kind).toBe("failure");
+    if (response.kind !== "failure") return;
+    expect(response.code).toBe("TIMEOUT");
+  });
+
+  it("returns TIMEOUT when fetch ignores the abort", async () => {
+    const clock = new ManualClock();
+    const promise = requestPage({
+      endpoint: "https://example.com/html/",
+      form: new URLSearchParams(),
+      deadlineMs: 20,
+      schedule: (fn, ms) => clock.schedule(fn, ms),
+      // Never settles and ignores the abort signal.
+      fetchImpl: () => new Promise<Response>(() => {}),
+    });
+    await clock.advance(20);
+    const response = await promise;
+    expect(response.kind).toBe("failure");
+    if (response.kind !== "failure") return;
+    expect(response.code).toBe("TIMEOUT");
+  });
+
+  it("returns TIMEOUT when the body read hangs", async () => {
+    const clock = new ManualClock();
+    const stream = new ReadableStream<Uint8Array>({
+      start() {
+        // Never enqueues or closes.
+      },
+    });
+    const promise = requestPage({
+      endpoint: "https://example.com/html/",
+      form: new URLSearchParams(),
+      deadlineMs: 20,
+      schedule: (fn, ms) => clock.schedule(fn, ms),
+      fetchImpl: async () => new Response(stream, { status: 200 }),
     });
     await clock.advance(20);
     const response = await promise;

@@ -25,15 +25,15 @@ import type { AppEnv } from "../env";
 import type {
   ErrorCode,
   SearchError,
-  SearchRequest,
+  SearchParams,
   SearchResult,
   SearchResultItem,
 } from "../types";
 
 /**
  * Search engine behind `DdgService`: FIFO queue, adaptive persisted pacing,
- * per-job deadlines, in-job retries and a persisted cooldown. Free of
- * `cloudflare:workers` so it also runs under Node.
+ * in-job retries and a persisted cooldown. Free of `cloudflare:workers` so it
+ * also runs under Node.
  */
 
 /** Cancellable timer. */
@@ -153,13 +153,11 @@ export function defaultDdgDeps(env: AppEnv): DdgDeps {
 }
 
 interface Job {
-  readonly req: SearchRequest;
-  readonly abort: AbortController;
+  readonly params: SearchParams;
   readonly promise: Promise<SearchResult>;
   resolve: (result: SearchResult) => void;
   settled: boolean;
   state: "queued" | "active";
-  cancelTimer: () => void;
   dispatches: number;
   pages: number;
   waitMs: number;
@@ -179,8 +177,7 @@ type DispatchOutcome =
   | { kind: "no_results" }
   | { kind: "challenge" }
   | { kind: "unparseable" }
-  | { kind: "failure"; failure: UpstreamFailure }
-  | { kind: "aborted"; message: string };
+  | { kind: "failure"; failure: UpstreamFailure };
 
 const NEVER_DISPATCHED = Number.NEGATIVE_INFINITY;
 
@@ -273,46 +270,51 @@ export class DdgEngine {
     );
   }
 
-  /** Persists the snapshot when it changed; never rejects. */
-  async #persistState(): Promise<void> {
+  /**
+   * Persists the snapshot when it changed; never rejects and never blocks.
+   *
+   * The in-memory policy is already applied by the caller; a failed write must
+   * not undo it. The Durable Object output gate still guarantees the write is
+   * durable before the RPC response, and per-object storage operations are
+   * ordered, so a late `#persisted` update cannot overwrite a newer one.
+   */
+  #persistState(): void {
     const next = this.#snapshot();
     if (this.#sameState(this.#persisted, next)) return;
-    try {
-      await this.#storage.put(STATE_KEY, next);
-      this.#persisted = next;
-    } catch (error) {
-      // Keep the in-memory state; a failed write must not undo policy changes.
-      this.#log("error", {
-        event: "ddg_storage_error",
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    void this.#storage.put(STATE_KEY, next).then(
+      () => {
+        this.#persisted = next;
+      },
+      (error: unknown) => {
+        // Keep the in-memory state; a failed write must not undo policy changes.
+        this.#log("error", {
+          event: "ddg_storage_error",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
   }
 
   /**
-   * Runs one complete search. `deadlineAt` is set by the Worker. Caller
-   * cancellation does not cross RPC; only the `deadlineAt` timer aborts an
-   * active job. While the global cooldown is active the call is rejected
-   * immediately with `RATE_LIMITED`, unless the remaining cooldown is at most
-   * `cooldownWaitMaxMs` and ends before the deadline: then the job is admitted
-   * and waits the remainder out in place before dispatching.
+   * Runs one complete search. Caller cancellation does not cross RPC.
+   *
+   * While the global cooldown is active the call is rejected immediately with
+   * `RATE_LIMITED`, unless the remaining cooldown is at most
+   * `cooldownWaitMaxMs`: then the job is admitted and waits the remainder out
+   * in place before dispatching. Termination is guaranteed by bounded page,
+   * attempt and redirect counts, not by a whole-call deadline.
    */
-  async search(req: SearchRequest): Promise<SearchResult> {
+  async search(params: SearchParams): Promise<SearchResult> {
     const remaining = this.#nextRetryAt - this.#now();
-    if (remaining > 0) {
-      const eligible =
-        remaining <= this.#deps.cooldownWaitMaxMs &&
-        this.#nextRetryAt < req.deadlineAt;
-      if (!eligible) {
-        this.#log("info", {
-          event: "ddg_search_rejected",
-          code: "RATE_LIMITED",
-          retryAfterMs: remaining,
-        });
-        return failed(makeError("RATE_LIMITED", "upstream cooling down", remaining));
-      }
+    if (remaining > this.#deps.cooldownWaitMaxMs) {
+      this.#log("info", {
+        event: "ddg_search_rejected",
+        code: "RATE_LIMITED",
+        retryAfterMs: remaining,
+      });
+      return failed(makeError("RATE_LIMITED", "upstream cooling down", remaining));
     }
-    const job = this.#createJob(req);
+    const job = this.#createJob(params);
     this.#queue.push(job);
     this.#ensureDrain();
     return job.promise;
@@ -322,42 +324,27 @@ export class DdgEngine {
     return this.#deps.clock.now();
   }
 
-  #createJob(req: SearchRequest): Job {
+  #createJob(params: SearchParams): Job {
     let resolve: (result: SearchResult) => void = () => {};
     const promise = new Promise<SearchResult>((res) => {
       resolve = res;
     });
-    const abort = new AbortController();
-    const job: Job = {
-      req,
-      abort,
+    return {
+      params,
       promise,
       resolve,
       settled: false,
       state: "queued",
-      cancelTimer: () => {},
       dispatches: 0,
       pages: 0,
       waitMs: 0,
       startedAt: this.#now(),
     };
-    const delay = Math.max(0, req.deadlineAt - this.#now());
-    const timer = this.#deps.clock.schedule(() => {
-      if (job.settled) return;
-      if (job.state === "queued") {
-        this.#settle(job, failed(makeError("TIMEOUT", "deadline exceeded while queued")));
-      } else {
-        job.abort.abort(new Error("job deadline exceeded"));
-      }
-    }, delay);
-    job.cancelTimer = () => timer.cancel();
-    return job;
   }
 
   #settle(job: Job, result: SearchResult): void {
     if (job.settled) return;
     job.settled = true;
-    job.cancelTimer();
     this.#logSearch(job, result);
     job.resolve(result);
   }
@@ -380,10 +367,6 @@ export class DdgEngine {
         const job = this.#queue.shift();
         if (job === undefined) break;
         if (job.settled) continue;
-        if (this.#now() >= job.req.deadlineAt) {
-          this.#settle(job, failed(makeError("TIMEOUT", "deadline exceeded before start")));
-          continue;
-        }
         job.state = "active";
         job.waitMs = Math.max(0, this.#now() - job.startedAt);
         await this.#runJob(job);
@@ -395,7 +378,7 @@ export class DdgEngine {
   }
 
   async #runJob(job: Job): Promise<void> {
-    const { params } = job.req;
+    const { params } = job;
     const results: SearchResultItem[] = [];
     const seen = new Set<string>();
     let fields = initialFields(params);
@@ -403,14 +386,6 @@ export class DdgEngine {
 
     try {
       for (;;) {
-        if (job.abort.signal.aborted) {
-          this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
-          return;
-        }
-        if (this.#now() >= job.req.deadlineAt) {
-          this.#settle(job, interruptedOrFailed(results, makeError("TIMEOUT", "search deadline exceeded")));
-          return;
-        }
         if (pages >= this.#deps.maxPages) {
           this.#settle(
             job,
@@ -422,27 +397,15 @@ export class DdgEngine {
           return;
         }
 
-        await this.#waitForPacing(job);
+        await this.#waitForPacing();
 
-        if (job.abort.signal.aborted) {
-          this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
-          return;
-        }
         // Wait out a cooldown that is almost over. Recompute the remainder from
         // the current time so pacing time already spent is not counted twice.
         const cooldownRemaining = this.#nextRetryAt - this.#now();
         if (cooldownRemaining > 0 && cooldownRemaining <= this.#deps.cooldownWaitMaxMs) {
-          await this.#deps.clock.sleep(cooldownRemaining, job.abort.signal);
-          if (job.abort.signal.aborted) {
-            this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
-            return;
-          }
+          await this.#deps.clock.sleep(cooldownRemaining);
         }
         const beforeDispatch = this.#now();
-        if (beforeDispatch >= job.req.deadlineAt) {
-          this.#settle(job, interruptedOrFailed(results, makeError("TIMEOUT", "search deadline exceeded")));
-          return;
-        }
         if (beforeDispatch < this.#nextRetryAt) {
           this.#settle(
             job,
@@ -456,57 +419,43 @@ export class DdgEngine {
 
         this.#lastDispatchAt = this.#now();
         job.dispatches += 1;
-        const remaining = job.req.deadlineAt - this.#now();
-        const timeoutMs = Math.max(1, Math.min(this.#deps.attemptTimeoutMs, remaining));
-        const outcome = await this.#dispatch(fields, job, timeoutMs);
+        const outcome = await this.#dispatch(fields, job, this.#deps.attemptTimeoutMs);
 
         switch (outcome.kind) {
-          case "aborted":
-            this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", outcome.message)));
-            return;
           case "failure":
-            if (!(await this.#handleUpstreamFailure(job, outcome.failure, results))) return;
+            if (!this.#handleUpstreamFailure(job, outcome.failure, results)) return;
             break;
           case "challenge":
             if (
-              !(await this.#handleUpstreamFailure(job, {
+              !this.#handleUpstreamFailure(job, {
                 kind: "challenge",
                 code: "PROVIDER_CHALLENGE",
                 message: "DuckDuckGo returned a bot challenge",
-              }, results))
+              }, results)
             ) {
               return;
             }
             break;
           case "no_results":
-            await this.#recordSuccess();
+            this.#recordSuccess();
             this.#settle(job, { status: "exhausted", results });
             return;
           case "unparseable":
             if (
-              !(await this.#handleUpstreamFailure(job, {
+              !this.#handleUpstreamFailure(job, {
                 kind: "transient",
                 code: "PARSE_FAILED",
                 message: "could not parse the results page",
-              }, results))
+              }, results)
             ) {
               return;
             }
             break;
           case "results": {
-            await this.#recordSuccess();
+            this.#recordSuccess();
             pages += 1;
             job.pages = pages;
             mergeResults(outcome.page.results, seen, results, params.maxResults);
-            // Re-check cancellation/deadline after fetching and parsing.
-            if (job.abort.signal.aborted) {
-              this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
-              return;
-            }
-            if (this.#now() >= job.req.deadlineAt) {
-              this.#settle(job, interruptedOrFailed(results, makeError("TIMEOUT", "search deadline exceeded")));
-              return;
-            }
             if (results.length >= params.maxResults) {
               this.#settle(job, { status: "ok", results });
               return;
@@ -534,21 +483,17 @@ export class DdgEngine {
     job: Job,
     timeoutMs: number,
   ): Promise<DispatchOutcome> {
-    const form = buildPageForm(fields, job.req.params);
+    const form = buildPageForm(fields, job.params);
     const response = await requestPage({
       endpoint: this.#deps.endpoint,
       form,
       deadlineMs: timeoutMs,
-      signal: job.abort.signal,
       fetchImpl: this.#deps.fetchImpl,
       maxBodyBytes: this.#deps.maxBodyBytes,
       schedule: (fn, ms) => this.#deps.clock.schedule(fn, ms),
     });
 
     if (response.kind === "failure") {
-      if (response.code === "ABORTED") {
-        return { kind: "aborted", message: response.message };
-      }
       return {
         kind: "failure",
         failure: { kind: "transient", code: "UPSTREAM_ERROR", message: response.message },
@@ -601,16 +546,16 @@ export class DdgEngine {
    * the same page within the active job, `false` once cooldown was entered and
    * the job has been settled.
    */
-  async #handleUpstreamFailure(
+  #handleUpstreamFailure(
     job: Job,
     failure: UpstreamFailure,
     results: SearchResultItem[],
-  ): Promise<boolean> {
+  ): boolean {
     this.#consecutiveFailures += 1;
     this.#intervalMs = this.#clampInterval(this.#intervalMs * this.#deps.increaseFactor);
 
     if (this.#consecutiveFailures < this.#deps.failureThreshold) {
-      await this.#persistState();
+      this.#persistState();
       return true;
     }
 
@@ -618,20 +563,20 @@ export class DdgEngine {
       failure.kind === "challenge" ? this.#deps.cooldownMs : this.#deps.transientDelayMs;
     this.#nextRetryAt = this.#now() + cooldown;
     this.#consecutiveFailures = 0;
-    // Flush queued searches before awaiting storage: a slow or failed write
-    // must not let them escape a (possibly short) cooldown window.
+    // Flush queued searches before persisting: a slow or failed write must not
+    // let them escape a (possibly short) cooldown window.
     this.#flushQueueForCooldown();
-    await this.#persistState();
+    this.#persistState();
     const error: SearchError = makeError(failure.code, failure.message, cooldown);
     this.#settle(job, interruptedOrFailed(results, error));
     return false;
   }
 
   /** Records one successful dispatch: reset the streak, decay the interval. */
-  async #recordSuccess(): Promise<void> {
+  #recordSuccess(): void {
     this.#consecutiveFailures = 0;
     this.#intervalMs = this.#clampInterval(this.#intervalMs * this.#deps.decreaseFactor);
-    await this.#persistState();
+    this.#persistState();
   }
 
   #flushQueueForCooldown(): void {
@@ -643,10 +588,10 @@ export class DdgEngine {
     }
   }
 
-  async #waitForPacing(job: Job): Promise<void> {
+  async #waitForPacing(): Promise<void> {
     if (this.#lastDispatchAt === NEVER_DISPATCHED) return;
     const wait = this.#lastDispatchAt + this.#intervalMs - this.#now();
-    if (wait > 0) await this.#deps.clock.sleep(wait, job.abort.signal);
+    if (wait > 0) await this.#deps.clock.sleep(wait);
   }
 
   #logSearch(job: Job, result: SearchResult): void {
@@ -656,7 +601,7 @@ export class DdgEngine {
       event: "ddg_search",
       status: result.status,
       count: result.results.length,
-      requested: job.req.params.maxResults,
+      requested: job.params.maxResults,
       pages: job.pages,
       dispatches: job.dispatches,
       waitMs: job.waitMs,

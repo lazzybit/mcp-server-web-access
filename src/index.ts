@@ -25,8 +25,8 @@ export default {
 
     const handler = createWebSearchHandler(
       {
-        search: (params: SearchParams, deadlineAt: number): Promise<SearchResult> =>
-          env.DDG_SERVICE.getByName(DDG_OBJECT_NAME).search({ params, deadlineAt }) as unknown as Promise<SearchResult>,
+        search: (params: SearchParams): Promise<SearchResult> =>
+          env.DDG_SERVICE.getByName(DDG_OBJECT_NAME).search(params) as unknown as Promise<SearchResult>,
         page: {
           // Public egress only: the search VPC binding is deliberately not used.
           fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),

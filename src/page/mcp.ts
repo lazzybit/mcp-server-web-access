@@ -5,8 +5,7 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { advertisedSchema, inputJsonSchemaOf } from "../tool-schema";
-import { PAGE_RUN_DEADLINE_MS, RENDER_THRESHOLD, USER_AGENT_NAME } from "./constants";
-import { Deadline } from "./deadline";
+import { RENDER_THRESHOLD, USER_AGENT_NAME } from "./constants";
 import { decideNeedsRender, needsRender } from "./decide";
 import { extract } from "./extract";
 import { probePage } from "./probe";
@@ -108,18 +107,13 @@ export function registerFetchPageTool(server: McpServer, deps: PageDeps): void {
 
 /** Validates arguments and runs the pipeline. Never throws. */
 export async function runFetchPage(deps: PageDeps, rawArgs: unknown): Promise<FetchPageOutput> {
-  const deadline = new Deadline(PAGE_RUN_DEADLINE_MS);
-  try {
-    return await executeFetchPage(deps, rawArgs, deadline);
-  } finally {
-    deadline.dispose();
-  }
+  return executeFetchPage(deps, rawArgs, Date.now());
 }
 
 async function executeFetchPage(
   deps: PageDeps,
   rawArgs: unknown,
-  deadline: Deadline,
+  startedAt: number,
 ): Promise<FetchPageOutput> {
   const raw = isRecord(rawArgs) ? rawArgs : {};
   const normalized: Record<string, unknown> = { ...raw };
@@ -137,7 +131,7 @@ async function executeFetchPage(
           .join("; "),
       ),
     );
-    logPage(output, null, 0, Date.now() - deadline.startedAt);
+    logPage(output, null, 0, Date.now() - startedAt);
     return output;
   }
 
@@ -147,17 +141,14 @@ async function executeFetchPage(
     url = parsePageUrl(requested);
   } catch (error) {
     const output = failedOutput({ requested, final: null }, toPageError(error, "BLOCKED_URL"));
-    logPage(output, null, 0, Date.now() - deadline.startedAt);
+    logPage(output, null, 0, Date.now() - startedAt);
     return output;
   }
-
-  const startedAt = deadline.startedAt;
 
   let snapshot: PageSnapshot;
   try {
     snapshot = await probePage(url, {
       fetch: deps.fetch,
-      deadline,
       userAgent: userAgent(deps.mcpDomain),
     });
   } catch (error) {
@@ -184,7 +175,6 @@ async function executeFetchPage(
     decision = await decideNeedsRender(snapshot, {
       fetch: deps.fetch,
       getApiKey: deps.getApiKey,
-      deadline,
     });
     if (needsRender(decision, RENDER_THRESHOLD) && browserEnabled && deps.browser !== undefined) {
       const renderStart = Date.now();
@@ -192,7 +182,6 @@ async function executeFetchPage(
         const outcome = await renderPage({
           binding: deps.browser,
           url: snapshot.finalUrl,
-          deadline,
           ...(deps.launchBrowser !== undefined ? { launch: deps.launchBrowser } : {}),
         });
         html = outcome.html;

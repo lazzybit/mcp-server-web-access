@@ -8,15 +8,15 @@
  * logged, measured, or included in an error.
  */
 import { DECISION_TIMEOUT_MS, JEVIE_MODEL, OPENROUTER_DECISIONS_ENDPOINT } from "./constants";
-import type { Deadline } from "./deadline";
-import { stageWindow } from "./deadline";
+import { operationWindow, withTimeout } from "./timeout";
 import type { PageSnapshot, RouteDecision } from "./types";
 
 export interface DecisionOptions {
   fetch: typeof fetch;
   /** Resolves the Secrets Store value; may throw. */
   getApiKey: () => Promise<string>;
-  deadline: Deadline;
+  /** Upper bound for the secret fetch plus the request. Defaults to `DECISION_TIMEOUT_MS`. */
+  timeoutMs?: number;
 }
 
 const ERROR_DECISION: RouteDecision = {
@@ -25,46 +25,55 @@ const ERROR_DECISION: RouteDecision = {
   needsRender: null,
 };
 
+const TIMEOUT_MESSAGE = "the decision request exceeded its deadline";
+
 export async function decideNeedsRender(
   snapshot: PageSnapshot,
   options: DecisionOptions,
 ): Promise<RouteDecision> {
-  const window = stageWindow(options.deadline, DECISION_TIMEOUT_MS);
+  // One window covers the secret fetch, the HTTP request and the response
+  // body; `withTimeout` guarantees settlement even when neither propagates the
+  // abort.
+  const window = operationWindow(options.timeoutMs ?? DECISION_TIMEOUT_MS);
   try {
     let apiKey: string;
     try {
-      apiKey = await options.getApiKey();
+      apiKey = await withTimeout(options.getApiKey(), window.remaining(), TIMEOUT_MESSAGE);
     } catch {
       return ERROR_DECISION;
     }
 
-    const response = await options.fetch(OPENROUTER_DECISIONS_ENDPOINT, {
-      method: "POST",
-      // workerd rejects `redirect: "error"` at runtime (`Invalid redirect
-      // value`), so `manual` is used and every non-2xx (including 3xx) is
-      // treated as a decision failure below. The intent (no redirect follow)
-      // is preserved.
-      redirect: "manual",
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: JEVIE_MODEL,
-        state: buildState(snapshot),
-        questions: QUESTIONS,
+    const response = await withTimeout(
+      options.fetch(OPENROUTER_DECISIONS_ENDPOINT, {
+        method: "POST",
+        // workerd rejects `redirect: "error"` at runtime (`Invalid redirect
+        // value`), so `manual` is used and every non-2xx (including 3xx) is
+        // treated as a decision failure below. The intent (no redirect follow)
+        // is preserved.
+        redirect: "manual",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: JEVIE_MODEL,
+          state: buildState(snapshot),
+          questions: QUESTIONS,
+        }),
+        signal: window.signal,
       }),
-      signal: window.signal,
-    });
+      window.remaining(),
+      TIMEOUT_MESSAGE,
+    );
 
     if (!response.ok) {
-      await response.body?.cancel().catch(() => undefined);
+      void response.body?.cancel().catch(() => undefined);
       return ERROR_DECISION;
     }
 
     let payload: unknown;
     try {
-      payload = await response.json();
+      payload = await withTimeout(response.json(), window.remaining(), TIMEOUT_MESSAGE);
     } catch {
       return ERROR_DECISION;
     }

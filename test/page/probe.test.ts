@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { Deadline } from "../../src/page/deadline";
 import { probePage } from "../../src/page/probe";
 import { parsePageUrl } from "../../src/page/ssrf";
 
@@ -24,7 +23,6 @@ describe("probePage", () => {
   it("returns a snapshot for static HTML with features", async () => {
     const snapshot = await probePage(parsePageUrl(START), {
       fetch: stubFetch(() => html("<html lang='en'><head><title>T</title></head><body><p>Hello</p></body></html>")),
-      deadline: new Deadline(5_000),
       userAgent: USER_AGENT,
     });
     expect(snapshot.status).toBe(200);
@@ -38,7 +36,6 @@ describe("probePage", () => {
   it("passes through text/markdown and text/plain without features", async () => {
     const markdown = await probePage(parsePageUrl(START), {
       fetch: stubFetch(() => new Response("# Title\n", { status: 200, headers: { "content-type": "text/markdown" } })),
-      deadline: new Deadline(5_000),
       userAgent: USER_AGENT,
     });
     expect(markdown.isMarkdownLike).toBe(true);
@@ -47,7 +44,6 @@ describe("probePage", () => {
 
     const plain = await probePage(parsePageUrl(START), {
       fetch: stubFetch(() => new Response("plain", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } })),
-      deadline: new Deadline(5_000),
       userAgent: USER_AGENT,
     });
     expect(plain.isMarkdownLike).toBe(true);
@@ -64,7 +60,6 @@ describe("probePage", () => {
     });
     const snapshot = await probePage(parsePageUrl(START), {
       fetch: stubFetch(() => new Response(stream, { status: 200, headers: { "content-type": "text/html" } })),
-      deadline: new Deadline(5_000),
       userAgent: USER_AGENT,
     });
     expect(snapshot.body).toBe(parts.join(""));
@@ -82,7 +77,6 @@ describe("probePage", () => {
     });
     const snapshot = await probePage(parsePageUrl(START), {
       fetch: fetchImpl,
-      deadline: new Deadline(5_000),
       userAgent: USER_AGENT,
     });
     expect(snapshot.finalUrl).toBe("https://example.com/next");
@@ -94,7 +88,7 @@ describe("probePage", () => {
       () => new Response(null, { status: 302, headers: { location: "http://127.0.0.1/" } }),
     );
     await expect(
-      probePage(parsePageUrl(START), { fetch: fetchImpl, deadline: new Deadline(5_000), userAgent: USER_AGENT }),
+      probePage(parsePageUrl(START), { fetch: fetchImpl, userAgent: USER_AGENT }),
     ).rejects.toMatchObject({ pageError: { code: "BLOCKED_URL" } });
   });
 
@@ -103,7 +97,7 @@ describe("probePage", () => {
       () => new Response(null, { status: 302, headers: { location: "/loop" } }),
     );
     await expect(
-      probePage(parsePageUrl(START), { fetch: fetchImpl, deadline: new Deadline(5_000), userAgent: USER_AGENT }),
+      probePage(parsePageUrl(START), { fetch: fetchImpl, userAgent: USER_AGENT }),
     ).rejects.toMatchObject({ pageError: { code: "FETCH_FAILED" } });
   });
 
@@ -111,7 +105,6 @@ describe("probePage", () => {
     await expect(
       probePage(parsePageUrl(START), {
         fetch: stubFetch(() => html("nope", 404)),
-        deadline: new Deadline(5_000),
         userAgent: USER_AGENT,
       }),
     ).rejects.toMatchObject({ pageError: { code: "FETCH_FAILED", retryable: true } });
@@ -119,7 +112,6 @@ describe("probePage", () => {
     await expect(
       probePage(parsePageUrl(START), {
         fetch: stubFetch(() => html("slow down", 429, { "retry-after": "2" })),
-        deadline: new Deadline(5_000),
         userAgent: USER_AGENT,
       }),
     ).rejects.toMatchObject({ pageError: { code: "FETCH_FAILED", retryAfterMs: 2_000 } });
@@ -134,13 +126,12 @@ describe("probePage", () => {
     await expect(
       probePage(parsePageUrl(START), {
         fetch: stubFetch(() => new Response(stream, { status: 200, headers: { "content-type": "text/html" } })),
-        deadline: new Deadline(5_000),
         userAgent: USER_AGENT,
       }),
     ).rejects.toMatchObject({ pageError: { code: "TOO_LARGE" } });
   });
 
-  it("times out when a stage exceeds the deadline", async () => {
+  it("times out when a hop exceeds its timeout", async () => {
     const hanging = ((_input: RequestInfo | URL, init?: RequestInit) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => {
@@ -153,7 +144,46 @@ describe("probePage", () => {
     await expect(
       probePage(parsePageUrl(START), {
         fetch: hanging,
-        deadline: new Deadline(30),
+        attemptTimeoutMs: 30,
+        userAgent: USER_AGENT,
+      }),
+    ).rejects.toMatchObject({ pageError: { code: "TIMEOUT" } });
+  });
+
+  it("bounds each redirect hop independently", async () => {
+    let calls = 0;
+    const hanging = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.resolve(
+          new Response(null, { status: 302, headers: { location: "/next" } }),
+        );
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      });
+    }) as typeof fetch;
+
+    await expect(
+      probePage(parsePageUrl(START), {
+        fetch: hanging,
+        attemptTimeoutMs: 30,
+        userAgent: USER_AGENT,
+      }),
+    ).rejects.toMatchObject({ pageError: { code: "TIMEOUT" } });
+    expect(calls).toBe(2);
+  });
+
+  it("times out even when fetch ignores the abort signal", async () => {
+    const ignoring = (() => new Promise<Response>(() => {})) as typeof fetch;
+    await expect(
+      probePage(parsePageUrl(START), {
+        fetch: ignoring,
+        attemptTimeoutMs: 30,
         userAgent: USER_AGENT,
       }),
     ).rejects.toMatchObject({ pageError: { code: "TIMEOUT" } });

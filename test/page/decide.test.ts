@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { Deadline } from "../../src/page/deadline";
 import { decideNeedsRender, needsRender } from "../../src/page/decide";
 import { emptyFeatures } from "../../src/page/types";
 import type { PageSnapshot } from "../../src/page/types";
@@ -29,7 +28,7 @@ function jsonFetch(payload: unknown, status = 200): typeof fetch {
 }
 
 function options(fetchImpl: typeof fetch, key: () => Promise<string> = async () => SYNTHETIC_KEY) {
-  return { fetch: fetchImpl, getApiKey: key, deadline: new Deadline(5_000) };
+  return { fetch: fetchImpl, getApiKey: key, };
 }
 
 describe("decideNeedsRender", () => {
@@ -113,7 +112,7 @@ describe("decideNeedsRender", () => {
     expect(calls).toBe(0);
   });
 
-  it("fails when the request exceeds the deadline", async () => {
+  it("fails when the request exceeds its timeout", async () => {
     const hanging = ((_input: RequestInfo | URL, init?: RequestInit) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => {
@@ -125,7 +124,16 @@ describe("decideNeedsRender", () => {
     const decision = await decideNeedsRender(snapshot(), {
       fetch: hanging,
       getApiKey: async () => SYNTHETIC_KEY,
-      deadline: new Deadline(30),
+      timeoutMs: 30,
+    });
+    expect(decision.source).toBe("error");
+  });
+
+  it("yields an error decision when getApiKey hangs", async () => {
+    const decision = await decideNeedsRender(snapshot(), {
+      fetch: jsonFetch({ answers: { needs_render: { type: "noul", noul: 0.5 } } }),
+      getApiKey: () => new Promise<string>(() => {}),
+      timeoutMs: 30,
     });
     expect(decision.source).toBe("error");
   });

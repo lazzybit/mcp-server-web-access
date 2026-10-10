@@ -7,7 +7,6 @@ import {
   MAX_OUTPUT_BYTES,
   MAX_QUERY_LENGTH,
   MAX_RESULTS_LIMIT,
-  RUN_DEADLINE_MS,
 } from "./constants";
 import { registerFetchPageTool } from "./page/mcp";
 import type { PageDeps } from "./page/mcp";
@@ -101,7 +100,7 @@ export type WebSearchOutput = z.infer<typeof webSearchOutputSchema>;
 
 /** The search dependency the tool is bound to (the Durable Object RPC). */
 export interface WebSearchDeps {
-  search(params: SearchParams, deadlineAt: number): Promise<SearchResult>;
+  search(params: SearchParams): Promise<SearchResult>;
 }
 
 /** Both tool dependencies, injected by the Worker entrypoint. */
@@ -179,7 +178,7 @@ export async function runWebSearch(
     region: parsed.data.region ?? DEFAULT_REGION,
     ...(parsed.data.freshness !== undefined ? { freshness: parsed.data.freshness } : {}),
   };
-  const result = await deps.search(params, Date.now() + RUN_DEADLINE_MS);
+  const result = await deps.search(params);
   return shrinkOutput(toOutput(params, result), MAX_OUTPUT_BYTES);
 }
 

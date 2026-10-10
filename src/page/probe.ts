@@ -6,8 +6,7 @@
  * `text/markdown`/`text/plain`, the raw text) is kept for reuse.
  */
 import { ACCEPT_HEADER, FETCH_ATTEMPT_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REDIRECTS } from "./constants";
-import type { Deadline } from "./deadline";
-import { stageWindow } from "./deadline";
+import { TimeoutError, operationWindow, withTimeout } from "./timeout";
 import { collectFeatures } from "./features";
 import { assertAllowedUrl } from "./ssrf";
 import { emptyFeatures } from "./types";
@@ -16,33 +15,35 @@ import { PageFailure, pageFailure } from "./types";
 
 export interface ProbeOptions {
   fetch: typeof fetch;
-  deadline: Deadline;
   userAgent: string;
   maxRedirects?: number;
+  /** Upper bound for one redirect hop (headers + body). Defaults to `FETCH_ATTEMPT_TIMEOUT_MS`. */
+  attemptTimeoutMs?: number;
 }
 
 export async function probePage(initialUrl: URL, options: ProbeOptions): Promise<PageSnapshot> {
   const fetchImpl = options.fetch;
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? FETCH_ATTEMPT_TIMEOUT_MS;
   let current = initialUrl;
   let redirects = 0;
 
   while (true) {
-    const window = stageWindow(options.deadline, FETCH_ATTEMPT_TIMEOUT_MS);
-    let response: Response;
+    // A fresh window per hop covers headers and body; the race guarantees
+    // settlement even when the fetch implementation ignores the abort signal.
+    const window = operationWindow(attemptTimeoutMs);
     try {
-      response = await fetchImpl(current.href, {
-        method: "GET",
-        redirect: "manual",
-        headers: { accept: ACCEPT_HEADER, "user-agent": options.userAgent },
-        signal: window.signal,
-      });
-    } catch (error) {
-      window.dispose();
-      throw classifyTransportError(error, window.timedOut(), options.deadline);
-    }
+      const response = await withTimeout(
+        fetchImpl(current.href, {
+          method: "GET",
+          redirect: "manual",
+          headers: { accept: ACCEPT_HEADER, "user-agent": options.userAgent },
+          signal: window.signal,
+        }),
+        window.remaining(),
+        "the request exceeded its deadline",
+      );
 
-    try {
       if (isRedirect(response.status)) {
         const location = response.headers.get("location");
         await cancelBody(response);
@@ -74,7 +75,11 @@ export async function probePage(initialUrl: URL, options: ProbeOptions): Promise
       }
 
       const { mime, charset } = parseContentType(response.headers.get("content-type"));
-      const bytes = await readBody(response, window.signal);
+      const bytes = await withTimeout(
+        readBody(response, window.signal),
+        window.remaining(),
+        "the request exceeded its deadline",
+      );
       const body = decodeBody(bytes, charset);
       const isMarkdownLike = mime === "text/markdown" || mime === "text/plain";
       const features = isMarkdownLike ? emptyFeatures() : await collectFeatures(body);
@@ -92,7 +97,7 @@ export async function probePage(initialUrl: URL, options: ProbeOptions): Promise
       };
     } catch (error) {
       if (error instanceof PageFailure) throw error;
-      throw classifyTransportError(error, window.timedOut(), options.deadline);
+      throw classifyTransportError(error, window.timedOut());
     } finally {
       window.dispose();
     }
@@ -103,12 +108,8 @@ function isRedirect(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
 }
 
-function classifyTransportError(
-  error: unknown,
-  stageTimedOut: boolean,
-  deadline: Deadline,
-): PageFailure {
-  if (deadline.expired() || stageTimedOut) {
+function classifyTransportError(error: unknown, stageTimedOut: boolean): PageFailure {
+  if (stageTimedOut || error instanceof TimeoutError) {
     return pageFailure("TIMEOUT", "the request exceeded its deadline");
   }
   if (error instanceof Error && error.name === "AbortError") {
@@ -136,10 +137,15 @@ export async function readBody(response: Response, signal: AbortSignal): Promise
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // Bounded cleanup: an abort/timeout must not leave a pending read holding
+  // the stream open.
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
   try {
     while (true) {
       if (signal.aborted) {
-        await reader.cancel().catch(() => undefined);
         const abortError = new Error("the request was aborted");
         abortError.name = "AbortError";
         throw abortError;
@@ -156,6 +162,7 @@ export async function readBody(response: Response, signal: AbortSignal): Promise
       }
     }
   } finally {
+    signal.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
   return concat(chunks, total);

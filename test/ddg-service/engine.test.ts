@@ -183,7 +183,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({ params: { ...REQUEST.params }, deadlineAt: clock.now() + 60_000 }),
+      engine.search({ ...REQUEST.params }),
     );
 
     expect(result.status).toBe("ok");
@@ -204,10 +204,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 10, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 10, region: "wt-wt" }),
     );
     expect(result.status).toBe("exhausted");
     expect(result.results).toHaveLength(1);
@@ -219,14 +216,8 @@ describe("DdgEngine", () => {
     upstream.pages = { "0": page(["https://a.example/"], null) };
     const { engine } = engineFor(clock, upstream);
 
-    const first = engine.search({
-      params: { query: "a", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const first = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
 
     await drive(clock, first);
     await drive(clock, second);
@@ -236,7 +227,7 @@ describe("DdgEngine", () => {
     expect(secondCall!.at - firstCall!.at).toBeGreaterThanOrEqual(5_000);
   });
 
-  it("times out a job while it is still queued", async () => {
+  it("completes a search that waited a long time in the queue", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
     upstream.pages = { "0": page(["https://a.example/"], null) };
@@ -244,48 +235,43 @@ describe("DdgEngine", () => {
     upstream.gate = new Promise<Response>((resolve) => {
       release = resolve;
     });
-    const { engine } = engineFor(clock, upstream);
+    const { engine } = engineFor(clock, upstream, { attemptTimeoutMs: 120_000 });
 
-    const active = engine.search({
-      params: { query: "a", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
-    const queued = engine.search({
-      params: { query: "b", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 1_000,
-    });
+    const active = engine.search({ query: "a", maxResults: 50, region: "wt-wt" });
+    const queued = engine.search({ query: "b", maxResults: 50, region: "wt-wt" });
 
+    // Let the first dispatch reach the gate, then advance well past the old
+    // whole-call deadline before releasing it.
     await flushMicrotasks();
-    await clock.advance(1_000);
-    const queuedResult = await queued;
-    expect(queuedResult.status).toBe("failed");
-    expect(codeOf(queuedResult)).toBe("TIMEOUT");
-
+    await clock.advance(60_000);
     release(new Response("body", { status: 200 }));
+
     const activeResult = await drive(clock, active);
+    const queuedResult = await drive(clock, queued);
     expect(activeResult.status).toBe("exhausted");
+    expect(queuedResult.status).toBe("exhausted");
+    expect(upstream.calls).toHaveLength(2);
   });
 
-  it("aborts an active job at its deadline and keeps partial results", async () => {
+  it("times out a stalled attempt and enters cooldown with partial results", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
     upstream.pages = { "0": page(["https://a.example/"], "25") };
     upstream.blockOn = new Set(["25"]);
-    const { engine } = engineFor(clock, upstream);
+    const { engine } = engineFor(clock, upstream, { attemptTimeoutMs: 1_000 });
 
-    const promise = engine.search({
-      params: { query: "a", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 5_000,
-    });
-    const result = await drive(clock, promise);
+    const result = await drive(
+      clock,
+      engine.search({ query: "a", maxResults: 50, region: "wt-wt" }),
+    );
 
     expect(result.status).toBe("interrupted");
     expect(result.results.map((item) => item.url)).toEqual(["https://a.example/"]);
     if (result.status !== "interrupted") return;
-    expect(result.error.code).toBe("ABORTED");
-    // A job deadline must not count as an upstream failure or set a cooldown.
-    expect(engine.getNextRetryAt()).toBe(0);
-    expect(engine.getConsecutiveFailures()).toBe(0);
+    // A per-attempt timeout is a transient upstream failure, not a TIMEOUT.
+    expect(result.error.code).toBe("UPSTREAM_ERROR");
+    expect(upstream.calls.map((call) => call.s)).toEqual(["0", "25", "25", "25"]);
+    expect(engine.getNextRetryAt()).toBe(clock.now() + 1_500);
   });
 
   it("retries the same page and enters cooldown on the third consecutive failure", async () => {
@@ -296,10 +282,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(codeOf(result)).toBe("PROVIDER_CHALLENGE");
@@ -311,10 +294,7 @@ describe("DdgEngine", () => {
     expect(stored.nextRetryAt).toBe(clock.now() + 60_000);
     expect(stored.consecutiveFailures).toBe(0);
 
-    const immediate = await engine.search({
-      params: { query: "y", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const immediate = await engine.search({ query: "y", maxResults: 1, region: "wt-wt" });
     expect(codeOf(immediate)).toBe("RATE_LIMITED");
     expect(upstream.calls).toHaveLength(3);
   });
@@ -325,14 +305,8 @@ describe("DdgEngine", () => {
     upstream.pages = { "0": { kind: "challenge" } };
     const { engine } = engineFor(clock, upstream);
 
-    const first = engine.search({
-      params: { query: "a", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 120_000,
-    });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 120_000,
-    });
+    const first = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
 
     const [firstResult, secondResult] = await drive(clock, Promise.all([first, second]));
 
@@ -341,12 +315,12 @@ describe("DdgEngine", () => {
     expect(upstream.calls).toHaveLength(3);
   });
 
-  it("rejects queued searches before the cooldown persist completes", async () => {
+  it("does not stall the FIFO while a storage write is pending", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
-    upstream.pages = { "0": { kind: "challenge" } };
+    upstream.pages = { "0": page(["https://a.example/"], null) };
     const storage = new GatedStorage();
-    saveState(storage, { intervalMs: 10_000, consecutiveFailures: 2 });
+    saveState(storage, { intervalMs: 10_000, consecutiveFailures: 0 });
     const engine = new DdgEngine(storage, deps(clock, upstream));
     await engine.load();
 
@@ -355,33 +329,21 @@ describe("DdgEngine", () => {
       release = resolve;
     });
 
-    let firstSettled = false;
-    const first = engine
-      .search({
-        params: { query: "a", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      })
-      .then((value) => {
-        firstSettled = true;
-        return value;
-      });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const first = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
+    const [firstResult, secondResult] = await drive(clock, Promise.all([first, second]));
 
-    await flushMicrotasks(10);
-    expect(firstSettled).toBe(false);
-    const secondResult = await second;
-    expect(codeOf(secondResult)).toBe("RATE_LIMITED");
-    expect(firstSettled).toBe(false);
+    // Both searches completed while the write was still gated.
+    expect(firstResult.status).toBe("ok");
+    expect(secondResult.status).toBe("ok");
+    expect(upstream.calls).toHaveLength(2);
+    expect(storage.puts).toBe(0);
+    expect((storage.values.get("ddgState") as PersistedState).intervalMs).toBe(10_000);
 
     release();
-    const firstResult = await first;
-    expect(codeOf(firstResult)).toBe("PROVIDER_CHALLENGE");
-    expect((storage.values.get("ddgState") as PersistedState).nextRetryAt).toBe(
-      clock.now() + 60_000,
-    );
+    await flushMicrotasks(10);
+    expect(storage.puts).toBeGreaterThanOrEqual(1);
+    expect((storage.values.get("ddgState") as PersistedState).intervalMs).toBe(5_000);
   });
 
   it("expires a cooldown without writing storage", async () => {
@@ -397,10 +359,7 @@ describe("DdgEngine", () => {
     await clock.advance(1_001);
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "y", maxResults: 2, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "y", maxResults: 2, region: "wt-wt" }),
     );
 
     expect(result.status).toBe("exhausted");
@@ -416,10 +375,7 @@ describe("DdgEngine", () => {
 
     const failed = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
     expect(codeOf(failed)).toBe("PROVIDER_CHALLENGE");
     expect(engine.getIntervalMs()).toBe(20_000);
@@ -429,10 +385,7 @@ describe("DdgEngine", () => {
     await clock.advance(60_001);
     const ok = await drive(
       clock,
-      engine.search({
-        params: { query: "y", maxResults: 2, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "y", maxResults: 2, region: "wt-wt" }),
     );
     expect(ok.status).toBe("exhausted");
     expect(engine.getIntervalMs()).toBe(20_000 * 0.7071);
@@ -452,10 +405,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 2, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 2, region: "wt-wt" }),
     );
     expect(result.status).toBe("exhausted");
     expect(engine.getConsecutiveFailures()).toBe(0);
@@ -466,27 +416,37 @@ describe("DdgEngine", () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
     upstream.pages = { "0": { kind: "challenge" } };
-    const storage = new MemoryStorage();
+    const storage = new GatedStorage();
+    saveState(storage, { intervalMs: 10_000, consecutiveFailures: 2 });
     const engine = new DdgEngine(storage, deps(clock, upstream));
     await engine.load();
 
-    // A short deadline stops the job after two failures, before the third
-    // attempt can trigger cooldown.
-    const partial = await drive(
+    let release: () => void = () => {};
+    storage.gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 12_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
-    expect(codeOf(partial)).toBe("ABORTED");
-    expect(engine.getConsecutiveFailures()).toBe(2);
+    expect(codeOf(result)).toBe("PROVIDER_CHALLENGE");
+
+    // The policy is applied in memory immediately; the write is still gated.
+    expect(engine.getConsecutiveFailures()).toBe(0);
     expect(engine.getIntervalMs()).toBe(20_000);
-    expect(upstream.calls).toHaveLength(2);
+    expect(engine.getNextRetryAt()).toBe(clock.now() + 60_000);
+    expect((storage.values.get("ddgState") as PersistedState).nextRetryAt).toBe(0);
+
+    release();
+    await flushMicrotasks(10);
+    const stored = storage.values.get("ddgState") as PersistedState;
+    expect(stored.nextRetryAt).toBe(clock.now() + 60_000);
+    expect(stored.intervalMs).toBe(20_000);
 
     const restored = new DdgEngine(storage, deps(clock, new Upstream(clock)));
     await restored.load();
-    expect(restored.getConsecutiveFailures()).toBe(2);
+    expect(restored.getNextRetryAt()).toBe(clock.now() + 60_000);
     expect(restored.getIntervalMs()).toBe(20_000);
   });
 
@@ -503,10 +463,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "a", maxResults: 2, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "a", maxResults: 2, region: "wt-wt" }),
     );
 
     // The parser throw is a retryable PARSE_FAILED, so the retry recovers.
@@ -525,10 +482,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "a", maxResults: 2, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "a", maxResults: 2, region: "wt-wt" }),
     );
 
     expect(codeOf(result)).toBe("PARSE_FAILED");
@@ -545,10 +499,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "a", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "a", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(codeOf(result)).toBe("UPSTREAM_ERROR");
@@ -567,10 +518,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(codeOf(result)).toBe("PROVIDER_CHALLENGE");
@@ -578,29 +526,29 @@ describe("DdgEngine", () => {
     expect(upstream.calls).toHaveLength(1);
   });
 
-  it("holds the active slot through abort cleanup before the next dispatch", async () => {
+  it("succeeds past the old whole-call deadline when waits add up", async () => {
     const clock = new ManualClock();
-    const start = clock.now();
     const upstream = new Upstream(clock);
-    upstream.pages = { "0": page(["https://a.example/"], "25") };
-    upstream.blockOn = new Set(["25"]);
-    const { engine } = engineFor(clock, upstream);
+    upstream.pages = { "0": page(["https://a.example/"], null) };
+    const storage = new MemoryStorage();
+    const start = clock.now();
+    saveState(storage, { intervalMs: 20_000, nextRetryAt: start + 9_000 });
+    const engine = new DdgEngine(
+      storage,
+      deps(clock, upstream, { increaseFactor: 1, decreaseFactor: 1 }),
+    );
+    await engine.load();
 
-    const first = engine.search({
-      params: { query: "a", maxResults: 50, region: "wt-wt" },
-      deadlineAt: start + 5_000,
-    });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: start + 60_000,
-    });
-    const [firstResult] = await drive(clock, Promise.all([first, second]));
+    const first = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
+    const [firstResult, secondResult] = await drive(clock, Promise.all([first, second]));
 
-    expect(firstResult.status).toBe("interrupted");
-    const firstPageCalls = upstream.calls.filter((call) => call.s === "0");
-    expect(firstPageCalls).toHaveLength(2);
-    // The second job only dispatches after the first was aborted at its deadline.
-    expect(firstPageCalls[1]!.at).toBeGreaterThanOrEqual(start + 5_000);
+    expect(firstResult.status).toBe("ok");
+    expect(secondResult.status).toBe("ok");
+    expect(upstream.calls).toHaveLength(2);
+    // A 9 s cooldown wait plus a 20 s pacing wait sum past the old 25 s limit.
+    expect(upstream.calls[0]!.at).toBe(start + 9_000);
+    expect(upstream.calls[1]!.at).toBeGreaterThan(start + 25_000);
   });
 
   it("treats an unparseable page as a retryable PARSE_FAILED", async () => {
@@ -611,10 +559,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(codeOf(result)).toBe("PARSE_FAILED");
@@ -635,10 +580,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
     expect(codeOf(result)).toBe("PROVIDER_CHALLENGE");
     expect(upstream.calls).toHaveLength(3);
@@ -654,10 +596,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
     expect(codeOf(result)).toBe("PROVIDER_CHALLENGE");
   });
@@ -670,10 +609,7 @@ describe("DdgEngine", () => {
 
     await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
     expect(storage.puts).toBe(0);
   });
@@ -686,10 +622,7 @@ describe("DdgEngine", () => {
     const engine = new DdgEngine(storage, deps(clock, upstream));
     await engine.load();
 
-    const result = await engine.search({
-      params: { query: "x", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const result = await engine.search({ query: "x", maxResults: 1, region: "wt-wt" });
     expect(codeOf(result)).toBe("RATE_LIMITED");
     expect(upstream.calls).toHaveLength(0);
   });
@@ -706,10 +639,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: start + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(result.status).toBe("ok");
@@ -729,32 +659,10 @@ describe("DdgEngine", () => {
     const engine = new DdgEngine(storage, deps(clock, upstream));
     await engine.load();
 
-    const result = await engine.search({
-      params: { query: "x", maxResults: 1, region: "wt-wt" },
-      deadlineAt: start + 60_000,
-    });
+    const result = await engine.search({ query: "x", maxResults: 1, region: "wt-wt" });
 
     expect(codeOf(result)).toBe("RATE_LIMITED");
     if ("error" in result) expect(result.error.retryAfterMs).toBe(10_001);
-    expect(upstream.calls).toHaveLength(0);
-  });
-
-  it("rejects a cooldown that outlasts the deadline", async () => {
-    const clock = new ManualClock();
-    const upstream = new Upstream(clock);
-    upstream.pages = { "0": page(["https://a.example/"], null) };
-    const storage = new MemoryStorage();
-    const start = clock.now();
-    saveState(storage, { nextRetryAt: start + 9_000 });
-    const engine = new DdgEngine(storage, deps(clock, upstream));
-    await engine.load();
-
-    const result = await engine.search({
-      params: { query: "x", maxResults: 1, region: "wt-wt" },
-      deadlineAt: start + 5_000,
-    });
-
-    expect(codeOf(result)).toBe("RATE_LIMITED");
     expect(upstream.calls).toHaveLength(0);
   });
 
@@ -770,10 +678,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: start + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(result.status).toBe("ok");
@@ -794,48 +699,13 @@ describe("DdgEngine", () => {
     );
     await engine.load();
 
-    const first = engine.search({
-      params: { query: "a", maxResults: 1, region: "wt-wt" },
-      deadlineAt: start + 60_000,
-    });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: start + 60_000,
-    });
+    const first = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
     await drive(clock, Promise.all([first, second]));
 
     expect(upstream.calls).toHaveLength(2);
     expect(upstream.calls[0]!.at).toBe(start + 3_000);
     expect(upstream.calls[1]!.at - upstream.calls[0]!.at).toBeGreaterThanOrEqual(5_000);
-  });
-
-  it("still aborts an active job at its deadline after waiting out a cooldown", async () => {
-    const clock = new ManualClock();
-    const upstream = new Upstream(clock);
-    upstream.pages = { "0": page(["https://a.example/"], "25") };
-    upstream.blockOn = new Set(["25"]);
-    const storage = new MemoryStorage();
-    const start = clock.now();
-    saveState(storage, { nextRetryAt: start + 8_000 });
-    const engine = new DdgEngine(storage, deps(clock, upstream));
-    await engine.load();
-
-    const result = await drive(
-      clock,
-      engine.search({
-        params: { query: "x", maxResults: 50, region: "wt-wt" },
-        deadlineAt: start + 20_000,
-      }),
-    );
-
-    expect(result.status).toBe("interrupted");
-    expect(codeOf(result)).toBe("ABORTED");
-    expect(result.results.map((item) => item.url)).toEqual(["https://a.example/"]);
-    expect(upstream.calls).toHaveLength(2);
-    // The first dispatch happens only after the cooldown has expired.
-    expect(upstream.calls[0]!.at).toBe(start + 8_000);
-    // A deadline abort must not count as an upstream failure or set a cooldown.
-    expect(engine.getNextRetryAt()).toBe(start + 8_000);
   });
 
   it("keeps an eligible arrival that lands while a cooldown write is pending", async () => {
@@ -855,18 +725,12 @@ describe("DdgEngine", () => {
 
     // The third consecutive failure enters a 1.5 s transient cooldown, then
     // blocks on the storage write.
-    const triggering = engine.search({
-      params: { query: "a", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const triggering = engine.search({ query: "a", maxResults: 1, region: "wt-wt" });
     await flushMicrotasks(10);
 
     // Arrives while the write is pending: the remainder is within the wait
     // limit, so it is admitted rather than rejected.
-    const late = engine.search({
-      params: { query: "b", maxResults: 10, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const late = engine.search({ query: "b", maxResults: 10, region: "wt-wt" });
 
     release();
     upstream.throwOn = new Set();
@@ -892,10 +756,7 @@ describe("DdgEngine", () => {
 
     const result = await drive(
       clock,
-      engine.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: start + 60_000,
-      }),
+      engine.search({ query: "x", maxResults: 1, region: "wt-wt" }),
     );
 
     expect(result.status).toBe("ok");
@@ -969,14 +830,8 @@ describe("DdgEngine", () => {
     };
     const { engine } = engineFor(clock, upstream, { parse });
 
-    const first = engine.search({
-      params: { query: "a", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
-    const second = engine.search({
-      params: { query: "b", maxResults: 1, region: "wt-wt" },
-      deadlineAt: clock.now() + 60_000,
-    });
+    const first = engine.search({ query: "a", maxResults: 50, region: "wt-wt" });
+    const second = engine.search({ query: "b", maxResults: 1, region: "wt-wt" });
     const [firstResult] = await drive(clock, Promise.all([first, second]));
 
     expect(firstResult.status).toBe("exhausted");
@@ -997,14 +852,8 @@ describe("DdgEngine", () => {
     };
     const { engine } = engineFor(clock, upstream);
 
-    const first = engine.search({
-      params: { query: "first", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 120_000,
-    });
-    const second = engine.search({
-      params: { query: "second", maxResults: 50, region: "wt-wt" },
-      deadlineAt: clock.now() + 120_000,
-    });
+    const first = engine.search({ query: "first", maxResults: 50, region: "wt-wt" });
+    const second = engine.search({ query: "second", maxResults: 50, region: "wt-wt" });
     let firstResolvedAt = -1;
     void first.then(() => {
       firstResolvedAt = clock.now();

@@ -44,10 +44,7 @@ describe("DdgService", () => {
         maxIntervalMs: 0,
       });
 
-      return instance.search({
-        params: { query: "x", maxResults: 3, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      });
+      return instance.search({ query: "x", maxResults: 3, region: "wt-wt" });
     });
 
     expect(result.status).toBe("ok");
@@ -72,19 +69,13 @@ describe("DdgService", () => {
         cooldownMs: 60_000,
       });
 
-      const challenged = await instance.search({
-        params: { query: "x", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 120_000,
-      });
+      const challenged = await instance.search({ query: "x", maxResults: 1, region: "wt-wt" });
       const stored = await state.storage.get<{
         intervalMs: number;
         consecutiveFailures: number;
         nextRetryAt: number;
       }>("ddgState");
-      const immediate = await instance.search({
-        params: { query: "y", maxResults: 1, region: "wt-wt" },
-        deadlineAt: clock.now() + 60_000,
-      });
+      const immediate = await instance.search({ query: "y", maxResults: 1, region: "wt-wt" });
       return { challenged, stored, immediate };
     });
 

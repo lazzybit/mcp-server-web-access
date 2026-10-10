@@ -1,5 +1,10 @@
 /** Contracts for the `fetch_page` tool. */
 
+/**
+ * `ABORTED` is kept for wire compatibility but is no longer emitted: there is
+ * no whole-call deadline or caller cancellation. `TIMEOUT` still covers a
+ * per-stage probe timeout.
+ */
 export type PageErrorCode =
   | "INVALID_INPUT"
   | "BLOCKED_URL"

@@ -6,10 +6,20 @@
  * chains) are validated against the URL policy when request interception is
  * available. Requests issued by page scripts, frames and XHR are outside this
  * boundary and are documented as such, not claimed to be covered.
+ *
+ * Every browser RPC that can hang is bounded by its own timeout; closing is
+ * bounded and allowed to give up rather than block the tool result.
  */
-import { BROWSER_NAV_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REDIRECTS, RENDERED_WAIT_MS } from "./constants";
-import type { Deadline } from "./deadline";
-import { sleep } from "./deadline";
+import {
+  BROWSER_CALL_TIMEOUT_MS,
+  BROWSER_CLOSE_TIMEOUT_MS,
+  BROWSER_LAUNCH_TIMEOUT_MS,
+  BROWSER_NAV_TIMEOUT_MS,
+  MAX_BODY_BYTES,
+  MAX_REDIRECTS,
+  RENDERED_WAIT_MS,
+} from "./constants";
+import { sleep, withTimeout } from "./timeout";
 import { isAllowedUrlString } from "./ssrf";
 import { PageFailure, pageFailure } from "./types";
 
@@ -41,9 +51,14 @@ export interface RenderOptions {
   binding: unknown;
   /** The statically resolved final URL to navigate to. */
   url: string;
-  deadline: Deadline;
   launch?: BrowserLauncher;
   maxRedirects?: number;
+  /** Bounds the launch. Defaults to `BROWSER_LAUNCH_TIMEOUT_MS`. */
+  launchTimeoutMs?: number;
+  /** Bounds `newPage`, setup and `content`. Defaults to `BROWSER_CALL_TIMEOUT_MS`. */
+  callTimeoutMs?: number;
+  /** Bounds `close`; giving up is acceptable. Defaults to `BROWSER_CLOSE_TIMEOUT_MS`. */
+  closeTimeoutMs?: number;
 }
 
 export interface RenderOutcome {
@@ -55,40 +70,54 @@ export interface RenderOutcome {
 export async function renderPage(options: RenderOptions): Promise<RenderOutcome> {
   const launch = await resolveLauncher(options.launch);
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
+  const launchTimeoutMs = options.launchTimeoutMs ?? BROWSER_LAUNCH_TIMEOUT_MS;
+  const callTimeoutMs = options.callTimeoutMs ?? BROWSER_CALL_TIMEOUT_MS;
+  const closeTimeoutMs = options.closeTimeoutMs ?? BROWSER_CLOSE_TIMEOUT_MS;
 
   const launchPromise = launch(options.binding);
-  const browser = await launchWithin(launchPromise, options.deadline.remaining());
-  if (browser === null) {
+  let browser: BrowserLike;
+  try {
+    browser = await withTimeout(launchPromise, launchTimeoutMs, "browser launch timed out");
+  } catch {
     // The launch may still resolve; close it so no session leaks.
-    void launchPromise.then((late) => late.close()).catch(() => undefined);
-    throw pageFailure("RENDER_FAILED", "browser launch exceeded the deadline");
+    void launchPromise
+      .then((late) => closeBounded(late, closeTimeoutMs))
+      .catch(() => undefined);
+    throw pageFailure("RENDER_FAILED", "browser launch timed out");
   }
 
   try {
-    const page = await browser.newPage();
-    try {
-      if (typeof page.setRequestInterception === "function") {
-        await page.setRequestInterception(true);
+    const page = await withTimeout(
+      browser.newPage(),
+      callTimeoutMs,
+      "browser page creation timed out",
+    );
+    if (typeof page.setRequestInterception === "function") {
+      try {
+        await withTimeout(
+          page.setRequestInterception(true),
+          callTimeoutMs,
+          "browser setup timed out",
+        );
         page.on("request", (request) => interceptRequest(request, maxRedirects));
+      } catch {
+        // Interception is best-effort; the final URL is still validated below.
       }
-    } catch {
-      // Interception is best-effort; the final URL is still validated below.
     }
 
-    const navTimeout = Math.min(BROWSER_NAV_TIMEOUT_MS, options.deadline.remaining());
-    if (navTimeout <= 0) {
-      throw pageFailure("RENDER_FAILED", "deadline exceeded before navigation");
-    }
-    await page.goto(options.url, { waitUntil: "domcontentloaded", timeout: navTimeout });
+    await page.goto(options.url, {
+      waitUntil: "domcontentloaded",
+      timeout: BROWSER_NAV_TIMEOUT_MS,
+    });
 
-    const waitMs = Math.min(RENDERED_WAIT_MS, options.deadline.remaining());
-    if (waitMs > 0) await sleep(waitMs, options.deadline.signal);
+    // The settling wait is intentional, not a timeout; it always runs in full.
+    await sleep(RENDERED_WAIT_MS);
 
-    if (options.deadline.expired()) {
-      throw pageFailure("TIMEOUT", "rendering exceeded the deadline");
-    }
-
-    const html = await page.content();
+    const html = await withTimeout(
+      page.content(),
+      callTimeoutMs,
+      "browser content timed out",
+    );
     if (byteLength(html) > MAX_BODY_BYTES) {
       throw pageFailure("TOO_LARGE", `rendered HTML exceeds ${MAX_BODY_BYTES} bytes`);
     }
@@ -102,7 +131,7 @@ export async function renderPage(options: RenderOptions): Promise<RenderOutcome>
     if (error instanceof PageFailure) throw error;
     throw pageFailure("RENDER_FAILED", "browser rendering failed");
   } finally {
-    await browser.close().catch(() => undefined);
+    await closeBounded(browser, closeTimeoutMs);
   }
 }
 
@@ -129,33 +158,13 @@ function interceptRequest(request: RequestLike, maxRedirects: number): void {
   }
 }
 
-function launchWithin(promise: Promise<BrowserLike>, ms: number): Promise<BrowserLike | null> {
-  if (ms <= 0) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        resolve(null);
-      }
-    }, ms);
-    promise.then(
-      (browser) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve(browser);
-        }
-      },
-      () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve(null);
-        }
-      },
-    );
-  });
+/** Closes a session under a bound; a slow or hanging close never blocks. */
+async function closeBounded(browser: BrowserLike, ms: number): Promise<void> {
+  try {
+    await withTimeout(browser.close(), ms, "browser close timed out");
+  } catch {
+    // Giving up on close must not block the result.
+  }
 }
 
 function byteLength(value: string): number {

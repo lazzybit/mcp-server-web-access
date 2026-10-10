@@ -4,10 +4,8 @@
 export const MAX_URL_LENGTH = 2048;
 /** Maximum number of redirect hops followed by the probe. */
 export const MAX_REDIRECTS = 5;
-/** Upper bound for a single GET (including body read). */
+/** Upper bound for a single GET (including body read); fresh per redirect hop. */
 export const FETCH_ATTEMPT_TIMEOUT_MS = 15_000;
-/** The single total deadline shared by every stage of one tool call. */
-export const PAGE_RUN_DEADLINE_MS = 45_000;
 /** Hard cap for the decoded response body (and the rendered HTML). */
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** Maximum number of visible-text characters sent to the decision model. */
@@ -20,7 +18,13 @@ export const READABILITY_CHAR_THRESHOLD = 250;
 export const DECISION_TIMEOUT_MS = 8_000;
 /** Upper bound for one browser navigation. */
 export const BROWSER_NAV_TIMEOUT_MS = 20_000;
-/** Settling wait after the browser reaches `domcontentloaded`. */
+/** Upper bound for a browser launch. */
+export const BROWSER_LAUNCH_TIMEOUT_MS = 20_000;
+/** Upper bound for a browser setup/page/content call. */
+export const BROWSER_CALL_TIMEOUT_MS = 20_000;
+/** Upper bound for closing a browser session; giving up is acceptable. */
+export const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+/** Settling wait after the browser reaches `domcontentloaded`; intentional, not a timeout. */
 export const RENDERED_WAIT_MS = 3_000;
 
 /** OpenRouter System One / Decisions endpoint (decisions shape). */

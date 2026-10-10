@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderPage } from "../../src/page/browser";
 import type { BrowserLauncher, PageLike, RequestLike } from "../../src/page/browser";
-import { Deadline } from "../../src/page/deadline";
 
 function page(overrides: Partial<PageLike>): PageLike {
   return {
@@ -35,7 +34,6 @@ describe("renderPage", () => {
     const outcome = await renderPage({
       binding: {},
       url: "https://example.com/",
-      deadline: new Deadline(5_000),
       launch: browser(page({}), closed),
     });
     expect(outcome).toEqual({ html: "<html>ok</html>", finalUrl: "https://example.com/final" });
@@ -53,7 +51,6 @@ describe("renderPage", () => {
       renderPage({
         binding: {},
         url: "https://example.com/",
-        deadline: new Deadline(5_000),
         launch: browser(failing, closed),
       }),
     ).rejects.toMatchObject({ pageError: { code: "RENDER_FAILED" } });
@@ -71,7 +68,6 @@ describe("renderPage", () => {
       renderPage({
         binding: {},
         url: "https://example.com/",
-        deadline: new Deadline(5_000),
         launch: browser(oversized, closed),
       }),
     ).rejects.toMatchObject({ pageError: { code: "TOO_LARGE" } });
@@ -89,7 +85,6 @@ describe("renderPage", () => {
       renderPage({
         binding: {},
         url: "https://example.com/",
-        deadline: new Deadline(5_000),
         launch: browser(redirected, closed),
       }),
     ).rejects.toMatchObject({ pageError: { code: "BLOCKED_URL" } });
@@ -122,14 +117,13 @@ describe("renderPage", () => {
       renderPage({
         binding: {},
         url: "https://example.com/",
-        deadline: new Deadline(5_000),
         launch: browser(intercepted, closed),
       }),
     ).rejects.toMatchObject({ pageError: { code: "RENDER_FAILED" } });
     expect(aborted).toBe(true);
   });
 
-  it("closes a session that resolves after the launch deadline", async () => {
+  it("closes a session that resolves after the launch timeout", async () => {
     const closed = { value: false };
     const slow: BrowserLauncher = () =>
       new Promise((resolve) => {
@@ -149,12 +143,69 @@ describe("renderPage", () => {
       renderPage({
         binding: {},
         url: "https://example.com/",
-        deadline: new Deadline(15),
+        launchTimeoutMs: 15,
         launch: slow,
       }),
     ).rejects.toMatchObject({ pageError: { code: "RENDER_FAILED" } });
 
     await new Promise((resolve) => setTimeout(resolve, 120));
     expect(closed.value).toBe(true);
+  });
+
+  it("times out a hanging newPage and still closes", async () => {
+    const closed = { value: false };
+    const hanging: BrowserLauncher = async () => ({
+      newPage: () => new Promise<PageLike>(() => {}),
+      async close() {
+        closed.value = true;
+      },
+    });
+    await expect(
+      renderPage({
+        binding: {},
+        url: "https://example.com/",
+        launch: hanging,
+        callTimeoutMs: 30,
+      }),
+    ).rejects.toMatchObject({ pageError: { code: "RENDER_FAILED" } });
+    expect(closed.value).toBe(true);
+  });
+
+  it("times out a hanging content call", async () => {
+    const closed = { value: false };
+    const hangingContent = page({
+      content: () => new Promise<string>(() => {}),
+    });
+    await expect(
+      renderPage({
+        binding: {},
+        url: "https://example.com/",
+        launch: browser(hangingContent, closed),
+        callTimeoutMs: 30,
+      }),
+    ).rejects.toMatchObject({ pageError: { code: "RENDER_FAILED" } });
+    expect(closed.value).toBe(true);
+  });
+
+  it("gives up on a hanging close without blocking the result", async () => {
+    let closed = false;
+    const hangingClose: BrowserLauncher = async () => ({
+      async newPage() {
+        return page({});
+      },
+      close: () =>
+        new Promise<void>(() => {
+          // Never resolves; the bounded close must give up.
+          closed = true;
+        }),
+    });
+    const outcome = await renderPage({
+      binding: {},
+      url: "https://example.com/",
+      launch: hangingClose,
+      closeTimeoutMs: 30,
+    });
+    expect(outcome.html).toBe("<html>ok</html>");
+    expect(closed).toBe(true);
   });
 });

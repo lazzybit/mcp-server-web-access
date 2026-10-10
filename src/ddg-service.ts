@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { DdgEngine, defaultDdgDeps } from "./ddg/engine";
 import type { DdgDeps, StoragePort } from "./ddg/engine";
-import type { SearchRequest, SearchResult } from "./types";
+import type { SearchParams, SearchResult } from "./types";
 
 export type { CancelTimer, Clock, DdgDeps, StoragePort } from "./ddg/engine";
 export { RealClock, defaultDdgDeps } from "./ddg/engine";
@@ -11,8 +11,7 @@ export const DDG_OBJECT_NAME = "global";
 
 /**
  * Global singleton Durable Object. It supplies the storage port and lifecycle;
- * the queue, adaptive pacing, retries, deadlines and cooldown live in
- * {@link DdgEngine}.
+ * the queue, adaptive pacing, retries and cooldown live in {@link DdgEngine}.
  */
 export class DdgService extends DurableObject<Env> {
   readonly #engine: DdgEngine;
@@ -24,14 +23,16 @@ export class DdgService extends DurableObject<Env> {
       put: <T>(key: string, value: T) => ctx.storage.put(key, value),
     };
     this.#engine = new DdgEngine(storage, defaultDdgDeps(env));
+    // The constructor's storage read stays platform-managed
+    // (`blockConcurrencyWhile`); everything else is per-operation timeouts.
     this.ctx.blockConcurrencyWhile(async () => {
       await this.#engine.load();
     });
   }
 
   /** Runs one complete search (called over RPC). */
-  async search(req: SearchRequest): Promise<SearchResult> {
-    return this.#engine.search(req);
+  async search(params: SearchParams): Promise<SearchResult> {
+    return this.#engine.search(params);
   }
 
   /** Test seam for `runInDurableObject` tests. */

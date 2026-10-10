@@ -30,8 +30,9 @@ The Worker authenticates, serves MCP and validates input/output.
   pacing interval (5–20 s) and a cooldown entered after three consecutive
   upstream failures.
 - `fetch_page`: one probe GET (redirects validated per hop), at most one
-  OpenRouter decisions call and at most one Browser Run render, all under a
-  single deadline. Readability is tried first and plain text is the fallback.
+  OpenRouter decisions call and at most one Browser Run render, each
+  operation bounded by its own timeout. Readability is tried first and plain
+  text is the fallback.
 
 ## Configuration (`wrangler.jsonc`)
 
@@ -109,9 +110,9 @@ empty result resets the failure streak and decays the interval (`×0.7071`, floo
 failures open a cooldown — 30 minutes for a provider challenge / HTTP 429, 1.5 s
 for any other upstream failure. While a cooldown is active, queued and new
 searches are rejected with `RATE_LIMITED` and `retryAfterMs`; when at most 10 s
-remain and the cooldown ends before the search deadline, the search is instead
-admitted and waits out the remainder in place before dispatching. The search
-that triggered the cooldown still returns its own upstream error.
+remain, the search is instead admitted and waits out the remainder in place
+before dispatching. The search that triggered the cooldown still returns its
+own upstream error.
 
 ### `fetch_page`
 
@@ -155,6 +156,33 @@ Pipeline:
 The full content is returned untruncated; truncation is the caller's job.
 Recoverable failures (`decision: "error"`, `RENDER_FAILED`) still yield
 `status: "ok"` when extraction succeeds.
+
+#### Timeouts
+
+There is no whole-call deadline. Each potentially hanging operation has its own
+bound, and termination comes from these timeouts plus bounded page, attempt and
+redirect counts.
+
+| Operation | Bound |
+| --- | --- |
+| `search_ddg` upstream attempt (headers + body) | 10 s |
+| Probe redirect hop (headers + body) | 15 s |
+| Decisions call (secret fetch + request + body) | 8 s |
+| Browser launch | 20 s |
+| Browser navigation | 20 s |
+| Browser setup / `content()` call | 20 s |
+| Browser close (giving up is acceptable) | 5 s |
+| Rendered settling wait (intentional, not a timeout) | 3 s |
+
+A per-operation timeout is not a new wire error: a stalled `search_ddg` attempt
+surfaces as an `UPSTREAM_ERROR` and feeds the retry/cooldown policy, and a
+stalled render surfaces as `RENDER_FAILED`. `ABORTED` and `search_ddg`'s
+`TIMEOUT` are kept in the schemas for wire compatibility but are no longer
+emitted.
+
+Synchronous CPU work after the body is read (HTML parsing, Readability,
+Markdown conversion, feature collection) cannot be interrupted by these timers;
+it is bounded by the 2 MiB body cap.
 
 #### Request security and residual risk
 
