@@ -1,6 +1,7 @@
 import {
   ATTEMPT_TIMEOUT_MS,
   COOLDOWN_MS,
+  COOLDOWN_WAIT_MAX_MS,
   FAILURE_THRESHOLD,
   INTERVAL_DECREASE_FACTOR,
   INTERVAL_INCREASE_FACTOR,
@@ -100,6 +101,7 @@ export interface DdgDeps {
   failureThreshold: number;
   attemptTimeoutMs: number;
   cooldownMs: number;
+  cooldownWaitMaxMs: number;
   transientDelayMs: number;
   maxPages: number;
   logLevel: LogLevel;
@@ -143,6 +145,7 @@ export function defaultDdgDeps(env: AppEnv): DdgDeps {
     failureThreshold: FAILURE_THRESHOLD,
     attemptTimeoutMs: ATTEMPT_TIMEOUT_MS,
     cooldownMs: COOLDOWN_MS,
+    cooldownWaitMaxMs: COOLDOWN_WAIT_MAX_MS,
     transientDelayMs: TRANSIENT_DELAY_MS,
     maxPages: MAX_PAGES,
     logLevel: env.LOG_LEVEL ?? "info",
@@ -289,15 +292,25 @@ export class DdgEngine {
   /**
    * Runs one complete search. `deadlineAt` is set by the Worker. Caller
    * cancellation does not cross RPC; only the `deadlineAt` timer aborts an
-   * active job. While the global cooldown is active, the call is rejected
-   * immediately with `RATE_LIMITED`.
+   * active job. While the global cooldown is active the call is rejected
+   * immediately with `RATE_LIMITED`, unless the remaining cooldown is at most
+   * `cooldownWaitMaxMs` and ends before the deadline: then the job is admitted
+   * and waits the remainder out in place before dispatching.
    */
   async search(req: SearchRequest): Promise<SearchResult> {
-    const now = this.#now();
-    if (now < this.#nextRetryAt) {
-      const retryAfterMs = this.#nextRetryAt - now;
-      this.#log("info", { event: "ddg_search_rejected", code: "RATE_LIMITED", retryAfterMs });
-      return failed(makeError("RATE_LIMITED", "upstream cooling down", retryAfterMs));
+    const remaining = this.#nextRetryAt - this.#now();
+    if (remaining > 0) {
+      const eligible =
+        remaining <= this.#deps.cooldownWaitMaxMs &&
+        this.#nextRetryAt < req.deadlineAt;
+      if (!eligible) {
+        this.#log("info", {
+          event: "ddg_search_rejected",
+          code: "RATE_LIMITED",
+          retryAfterMs: remaining,
+        });
+        return failed(makeError("RATE_LIMITED", "upstream cooling down", remaining));
+      }
     }
     const job = this.#createJob(req);
     this.#queue.push(job);
@@ -374,7 +387,6 @@ export class DdgEngine {
         job.state = "active";
         job.waitMs = Math.max(0, this.#now() - job.startedAt);
         await this.#runJob(job);
-        if (this.#now() < this.#nextRetryAt) this.#flushQueueForCooldown();
       }
     } finally {
       this.#running = false;
@@ -415,6 +427,16 @@ export class DdgEngine {
         if (job.abort.signal.aborted) {
           this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
           return;
+        }
+        // Wait out a cooldown that is almost over. Recompute the remainder from
+        // the current time so pacing time already spent is not counted twice.
+        const cooldownRemaining = this.#nextRetryAt - this.#now();
+        if (cooldownRemaining > 0 && cooldownRemaining <= this.#deps.cooldownWaitMaxMs) {
+          await this.#deps.clock.sleep(cooldownRemaining, job.abort.signal);
+          if (job.abort.signal.aborted) {
+            this.#settle(job, interruptedOrFailed(results, makeError("ABORTED", "search aborted")));
+            return;
+          }
         }
         const beforeDispatch = this.#now();
         if (beforeDispatch >= job.req.deadlineAt) {

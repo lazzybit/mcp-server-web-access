@@ -108,8 +108,10 @@ empty result resets the failure streak and decays the interval (`×0.7071`, floo
 5 s); each upstream failure grows it (`×2`, ceiling 20 s). Three consecutive
 failures open a cooldown — 30 minutes for a provider challenge / HTTP 429, 1.5 s
 for any other upstream failure. While a cooldown is active, queued and new
-searches are rejected with `RATE_LIMITED` and `retryAfterMs`; the search that
-triggered it still returns its own upstream error.
+searches are rejected with `RATE_LIMITED` and `retryAfterMs`; when at most 10 s
+remain and the cooldown ends before the search deadline, the search is instead
+admitted and waits out the remainder in place before dispatching. The search
+that triggered the cooldown still returns its own upstream error.
 
 ### `fetch_page`
 

@@ -16,6 +16,8 @@ export const ATTEMPT_TIMEOUT_MS = 10_000;
 export const COOLDOWN_MS = 1_800_000;
 /** `nextRetryAt` delay after the third consecutive non-challenge upstream failure. */
 export const TRANSIENT_DELAY_MS = 1_500;
+/** When the cooldown remainder is at most this, an admitted search waits it out in place. */
+export const COOLDOWN_WAIT_MAX_MS = 10_000;
 /** Upper bound for `deadlineAt` relative to "now"; set by the Worker. */
 export const RUN_DEADLINE_MS = 25_000;
 /** Maximum pages fetched for one complete search. */
