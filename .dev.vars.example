@@ -1,0 +1,20 @@
+# Local development overrides. Never use these values in production.
+# `wrangler dev` merges this file into the worker env, overriding wrangler.jsonc vars.
+
+# Enable the development-only code path (dev principal injection) and point the
+# MCP host check at the local dev server.
+ENVIRONMENT=development
+MCP_DOMAIN=localhost
+
+# Fake principal used while ENVIRONMENT=development. `authenticate` ignores it
+# in production.
+# DEV_PRINCIPAL={"subject":"local-user","email":"local@example.com"}
+
+# `fetch_page` toggles (defaults live in wrangler.jsonc).
+# PAGE_ROUTER=on
+# BROWSER_ENABLED=true
+#
+# Plain `wrangler dev` runs locally and cannot resolve Secrets Store secrets;
+# the decision path then fails over to static HTML (`decision.source: "error"`).
+# Use a remote-bindings dev setup (`wrangler dev --remote`) to exercise the
+# OpenRouter decision and Browser Run render.

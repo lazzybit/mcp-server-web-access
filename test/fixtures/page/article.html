@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Getting started — Example Docs</title>
+  </head>
+  <body>
+    <header><nav><a href="/">Home</a> <a href="/docs">Docs</a></nav></header>
+    <main>
+      <article>
+        <h1>Getting started</h1>
+        <p>
+          This guide explains how to install the example client and connect it to
+          a workspace. It describes the configuration file, the authentication
+          handshake and the common failure modes you may encounter.
+        </p>
+        <p>
+          The client reads a configuration file from the working directory and
+          resolves the base URL from the <code>EXAMPLE_HOST</code> variable. See
+          the <a href="/docs/configuration">configuration reference</a> for the
+          full list of options and their defaults.
+        </p>
+        <h2>Installation</h2>
+        <p>
+          Install the package with your package manager of choice. The install
+          is idempotent and can be re-run safely after upgrading the runtime.
+        </p>
+        <pre><code class="language-js">import { createClient } from "example";
+
+const client = createClient({ host: process.env.EXAMPLE_HOST });
+await client.connect();
+</code></pre>
+        <h2>Configuration options</h2>
+        <table>
+          <thead>
+            <tr><th>Option</th><th>Default</th><th>Description</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>host</code></td><td>(required)</td><td>Base URL of the workspace.</td></tr>
+            <tr><td><code>retries</code></td><td>3</td><td>Number of retry attempts.</td></tr>
+            <tr><td><code>timeoutMs</code></td><td>5000</td><td>Per-request timeout.</td></tr>
+          </tbody>
+        </table>
+        <h2>Troubleshooting</h2>
+        <p>
+          When the handshake fails, check that the host is reachable and that the
+          clock is synchronised. A skewed clock invalidates the signed tokens
+          and produces an authentication error even when the credentials are
+          correct.
+        </p>
+        <ul>
+          <li>Verify the host resolves from the machine running the client.</li>
+          <li>Confirm the system clock is within a few seconds of UTC.</li>
+          <li>Re-run the install if the package version is pinned incorrectly.</li>
+        </ul>
+      </article>
+    </main>
+    <footer><p>© Example</p></footer>
+  </body>
+</html>

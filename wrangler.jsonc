@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mcp-server-web-access",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-15",
+  // `agents/mcp/server` imports `node:async_hooks` (AsyncLocalStorage); the MCP
+  // SDK also reaches other node builtins, so enable the compat runtime.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "web-access.mcp.nomonator.com", "custom_domain": true }],
+
+  // Optional: when bound, DuckDuckGo egress goes through the VPC Network
+  // (the `pie` tunnel) instead of Cloudflare's shared edge IPs. Remove this
+  // block to fall back to the Worker's built-in fetch.
+  "vpc_networks": [
+    { "binding": "SEARCH_VNC", "tunnel_id": "241ec850-6b53-4e44-b0e4-3e4f39fb946f", "remote": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "DDG_SERVICE", "class_name": "DdgService" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DdgService"] }],
+
+  // Browser Run binding for the optional single render in `fetch_page`.
+  "browser": { "binding": "BROWSER" },
+
+  // OpenRouter API key for the `needs_render` decision. The secret lives in
+  // Secrets Store (scope `workers`); only the binding is declared here.
+  "secrets_store_secrets": [
+    {
+      "binding": "OPENROUTER_API_KEY",
+      "store_id": "1405a8f65cb442849863d191dfa1336b",
+      "secret_name": "openrouter_api_key"
+    }
+  ],
+
+  "vars": {
+    "ENVIRONMENT": "production",
+    "MCP_DOMAIN": "web-access.mcp.nomonator.com",
+    "TEAM_DOMAIN": "nomonator.cloudflareaccess.com",
+    "APPLICATION_AUD": "19e4239f2e84c8f6a170c9ca303ec5031f339de92bb7a864c3a80cd294272a94",
+    "LOG_LEVEL": "info",
+    "PAGE_ROUTER": "on",
+    "BROWSER_ENABLED": "true"
+  },
+  "observability": { "enabled": true }
+}
