@@ -13,4 +13,11 @@ export interface AppEnv {
    * of the built-in fetch. A failing VPC fetch is reported as an upstream error.
    */
   SEARCH_VNC?: { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> };
+  /**
+   * Browser kill switch. Widened from the generated `"true"` literal so the
+   * `"false"` test binding and runtime comparisons type-check.
+   */
+  BROWSER_ENABLED?: string;
+  /** Browser Run binding used by the `search_ddg` fallback and `fetch_page`. */
+  BROWSER?: unknown;
 }

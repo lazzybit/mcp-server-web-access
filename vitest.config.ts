@@ -10,6 +10,9 @@ export default defineConfig({
           ENVIRONMENT: "development",
           MCP_DOMAIN: "example.com",
           DEV_PRINCIPAL: JSON.stringify({ subject: "test-user" }),
+          // Never launch a real browser from Durable Object tests; the fallback
+          // tests inject a fake launcher via `setTestBrowserDeps`.
+          BROWSER_ENABLED: "false",
         },
       },
     }),

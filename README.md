@@ -28,7 +28,9 @@ The Worker authenticates, serves MCP and validates input/output.
 - `search_ddg`: `DdgService` is the only component that contacts DuckDuckGo:
   FIFO complete searches, in-job pagination and retries, an adaptive persisted
   pacing interval (5–20 s) and a cooldown entered after three consecutive
-  upstream failures.
+  upstream failures. While a cooldown is active, a search that would be
+  rejected with `RATE_LIMITED` instead falls back to one headless-browser
+  search before giving up.
 - `fetch_page`: one probe GET (redirects validated per hop), at most one
   OpenRouter decisions call and at most one Browser Run render, each
   operation bounded by its own timeout. Readability is tried first and plain
@@ -44,7 +46,7 @@ The Worker authenticates, serves MCP and validates input/output.
 | `APPLICATION_AUD` | yes | Access application AUD tag | The Access application's settings. |
 | `LOG_LEVEL` | no | `debug` / `info` / `warn` / `error` | Defaults to `info`. |
 | `PAGE_ROUTER` | no | `on` / `off` | `off` skips the decision model and never renders. Defaults to `on`. |
-| `BROWSER_ENABLED` | no | `true` / `false` | Browser kill switch. Defaults to `true`. |
+| `BROWSER_ENABLED` | no | `true` / `false` | Browser kill switch for the `fetch_page` render and the `search_ddg` cooldown fallback. Defaults to `true`. |
 
 `MCP_DOMAIN` and `TEAM_DOMAIN` are never derived from a request. `TEAM_DOMAIN` is
 a bare domain: the issuer is `https://<TEAM_DOMAIN>` and the JWKS URL is
@@ -55,7 +57,7 @@ a bare domain: the issuer is `https://<TEAM_DOMAIN>` and the JWKS URL is
 | Binding | Type | Purpose |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | Secrets Store secret | OpenRouter API key (secret name `openrouter_api_key`, scope `workers`). Read via `await env.OPENROUTER_API_KEY.get()` and used only as the `Authorization: Bearer` header for the decisions request. |
-| `BROWSER` | Browser Run | Headless Chromium session for the single optional render. |
+| `BROWSER` | Browser Run | Headless Chromium session for the optional `fetch_page` render and the `search_ddg` cooldown fallback. |
 | `DDG_SERVICE` | Durable Object | The search service. |
 | `SEARCH_VNC` | VPC Network (optional) | DuckDuckGo egress only. `fetch_page` never uses it. |
 
@@ -114,6 +116,19 @@ remain, the search is instead admitted and waits out the remainder in place
 before dispatching. The search that triggered the cooldown still returns its
 own upstream error.
 
+When the engine returns `failed` + `RATE_LIMITED` and the browser is enabled,
+`DdgService` runs one browser fallback instead of returning the rate limit. The
+fallback is serialized (FIFO, one at a time), drives the JavaScript
+`duckduckgo.com` site with the desktop Chrome User-Agent, viewport and
+`accept-language`, and paginates by clicking the text-matched `More results`
+button up to `MAX_PAGES` batches. URLs are normalized and deduplicated across
+batches through the same `normalizeResultUrl`. Browser results never modify the
+engine's `nextRetryAt`, failure streak or pacing interval; a fallback that
+fails or hits the page limit with zero results returns the original
+`RATE_LIMITED` with `retryAfterMs` recomputed from the current cooldown. The
+internal log line records the source as `event: "ddg_browser_fallback"`; the
+tool output schema is unchanged.
+
 ### `fetch_page`
 
 Input:
@@ -166,6 +181,11 @@ redirect counts.
 | Operation | Bound |
 | --- | --- |
 | `search_ddg` upstream attempt (headers + body) | 10 s |
+| `search_ddg` browser fallback launch | 20 s |
+| `search_ddg` browser fallback navigation | 20 s |
+| `search_ddg` browser fallback setup / extraction / click | 20 s each |
+| `search_ddg` browser fallback result wait (shared across polls) | 15 s per load |
+| `search_ddg` browser fallback close (giving up is acceptable) | 5 s |
 | Probe redirect hop (headers + body) | 15 s |
 | Decisions call (secret fetch + request + body) | 8 s |
 | Browser launch | 20 s |
@@ -183,6 +203,20 @@ emitted.
 Synchronous CPU work after the body is read (HTML parsing, Readability,
 Markdown conversion, feature collection) cannot be interrupted by these timers;
 it is bounded by the 2 MiB body cap.
+
+#### Browser fallback residual risk
+
+- The fallback depends on an emulated desktop-browser fingerprint; DuckDuckGo
+  may change its detection at any time, so challenge detection is mandatory and
+  a challenge is reported as `PROVIDER_CHALLENGE`.
+- Browser Run can fail with `429` on launch; such a failure falls back to the
+  original `RATE_LIMITED`.
+- The worst case for one fallback is finite: launch 20 s + `newPage` 20 s +
+  setup 20 s + navigation 20 s + results 15 s + extraction 20 s + up to four
+  loads of (click 20 s + wait 15 s) + close 5 s.
+- `withTimeout` does not cancel remote work, and synchronous parsing is not
+  interruptible; a launch that resolves after its timeout is closed under a
+  bound, but a leaked remote session cannot be strictly guaranteed against.
 
 #### Request security and residual risk
 
@@ -214,6 +248,8 @@ decision path fails over to static HTML; use a remote-bindings setup
 
 - `search_ddg`: one JSON line per search (`event: "ddg_search"`) with status,
   count, pages, dispatches, wait/elapsed time and error info.
+- `search_ddg` cooldown fallback: one JSON line (`event: "ddg_browser_fallback"`)
+  with status, count, elapsed time and error code.
 - `fetch_page`: one JSON line per call (`event: "fetch_page"`) with status,
   rendered, extraction, format, decision source/model/needsRender, `renderMs`,
   `elapsedMs`, `redirects`, `finalHost`, `bytes` and `chars`.
@@ -235,6 +271,14 @@ Query strings, page URLs, content and credentials are never logged. Alert on
   exercised through the Browser Run binding.
 - `RENDER_THRESHOLD` is not calibrated; the bundled fixtures only verify
   behaviour, not the threshold.
+- The cooldown fallback was verified through a throwaway, token-gated Browser
+  Run worker: the JavaScript DuckDuckGo page returned the challenge under the
+  default headless configuration and returned results under one combined
+  configuration (desktop Chrome UA + viewport + `accept-language`). 10 result
+  containers were observed, and clicking the text-matched `More results` button
+  twice produced 40 containers. Ad exclusion, the explicit no-results/last-page
+  markers and the real effect of `kl`/`df` remain unverified; the 10 → 40 figure
+  is a container count, not a unique-URL count.
 
 ## Testing
 

@@ -1,4 +1,4 @@
-import { MAX_BODY_BYTES } from "../constants";
+import { BROWSER_SEARCH_USER_AGENT, MAX_BODY_BYTES } from "../constants";
 import type { Freshness, SearchParams } from "../types";
 
 /** DuckDuckGo HTML endpoint. Fixed in code; user input never reaches the URL. */
@@ -9,8 +9,7 @@ export const DEFAULT_ENDPOINT = "https://html.duckduckgo.com/html/";
  * negotiates and decompresses compression itself.
  */
 export const APP_HEADERS: Readonly<Record<string, string>> = {
-  "user-agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+  "user-agent": BROWSER_SEARCH_USER_AGENT,
   "accept":
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
   "accept-language": "en-US,en;q=0.9",

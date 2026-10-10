@@ -14,6 +14,7 @@ export default defineConfig({
     environment: "node",
     include: [
       "test/ddg/request.test.ts",
+      "test/ddg/browser-search.test.ts",
       "test/ddg-service/engine.test.ts",
       "test/access/*.test.ts",
       "test/mcp/contract.test.ts",

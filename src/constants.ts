@@ -30,3 +30,19 @@ export const MAX_QUERY_LENGTH = 512;
 export const MAX_RESULTS_LIMIT = 50;
 /** Default DuckDuckGo region. */
 export const DEFAULT_REGION = "wt-wt";
+
+/** Browser fallback search endpoint (the JavaScript DuckDuckGo site). */
+export const BROWSER_SEARCH_ENDPOINT = "https://duckduckgo.com/";
+/** Desktop Chrome User-Agent shared with the HTTP search headers. */
+export const BROWSER_SEARCH_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+/** Viewport advertised by the browser fallback. */
+export const BROWSER_SEARCH_VIEWPORT = { width: 1280, height: 720 } as const;
+/** `accept-language` header advertised by the browser fallback. */
+export const BROWSER_SEARCH_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
+/** Upper bound for waiting on result containers after a search or pagination load. */
+export const BROWSER_SEARCH_RESULTS_TIMEOUT_MS = 15_000;
+/** Polling interval while waiting for result containers. */
+export const BROWSER_SEARCH_POLL_INTERVAL_MS = 250;
+/** Maximum result batches fetched by the browser fallback. */
+export const BROWSER_SEARCH_MAX_PAGES = MAX_PAGES;
