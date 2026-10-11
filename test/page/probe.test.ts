@@ -188,4 +188,123 @@ describe("probePage", () => {
       }),
     ).rejects.toMatchObject({ pageError: { code: "TIMEOUT" } });
   });
+
+  it("strips non-content markup while streaming", async () => {
+    const body =
+      `<!DOCTYPE html><!-- top --><html lang="en"><head><title>T</title>` +
+      `<style>.a{color:red}</style><script>var s=1;</script>` +
+      `<script type="application/ld+json">{"headline":"LD"}</script></head>` +
+      `<body><!-- inner --><svg><text>svg</text></svg>` +
+      `<p>Hello <a href="data:text/html,x">link</a></p>` +
+      `<img src="https://example.com/a.png" srcset="data:image/png;base64,AAAA 1x, https://example.com/b.png 2x">` +
+      `</body></html>`;
+    const snapshot = await probePage(parsePageUrl(START), {
+      fetch: stubFetch(() => html(body)),
+      userAgent: USER_AGENT,
+    });
+    expect(snapshot.body).not.toContain("var s=1");
+    expect(snapshot.body).not.toContain("<style");
+    expect(snapshot.body).not.toContain("<svg");
+    expect(snapshot.body).not.toContain("<!--");
+    expect(snapshot.body).not.toContain("data:image");
+    expect(snapshot.body).not.toContain('href="data:');
+    expect(snapshot.body).toContain('type="application/ld+json"');
+    expect(snapshot.body).toContain("https://example.com/a.png");
+    expect(snapshot.body).toContain("https://example.com/b.png 2x");
+    expect(snapshot.body).toContain("Hello");
+    expect(snapshot.bytes).toBe(new TextEncoder().encode(body).byteLength);
+  });
+
+  it("succeeds for a script-heavy page whose filtered HTML fits the cap", async () => {
+    const filler = "<p>Readable content that stays in the snapshot body.</p>".repeat(20);
+    const scripts = `<script>${"var x=1;".repeat(400_000)}</script>`;
+    const body = `<html><head><title>Big</title></head><body>${filler}${scripts}</body></html>`;
+    expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(2 * 1024 * 1024);
+    const snapshot = await probePage(parsePageUrl(START), {
+      fetch: stubFetch(() => html(body)),
+      userAgent: USER_AGENT,
+    });
+    expect(snapshot.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(snapshot.body).toContain("Readable content");
+    expect(snapshot.body).not.toContain("var x=1");
+    expect(new TextEncoder().encode(snapshot.body).byteLength).toBeLessThanOrEqual(2 * 1024 * 1024);
+  });
+
+  it("fails with TOO_LARGE when the filtered HTML crosses the cap and cancels the source", async () => {
+    let cancelled = false;
+    let emitted = 0;
+    const chunk = new TextEncoder().encode(`<p>${"x".repeat(512 * 1024 - 7)}</p>`);
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (emitted >= 8) {
+          controller.close();
+          return;
+        }
+        emitted += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    await expect(
+      probePage(parsePageUrl(START), {
+        fetch: stubFetch(() => new Response(stream, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } })),
+        userAgent: USER_AGENT,
+      }),
+    ).rejects.toMatchObject({ pageError: { code: "TOO_LARGE" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(cancelled).toBe(true);
+  });
+
+  it("decodes correctly when tags, entities and multibyte characters are split across chunks", async () => {
+    const value = `<html><body><p>h\u00e9llo \u2014 \u4e16\u754c &amp; more</p><script>var s=1;</script></body></html>`;
+    const bytes = new TextEncoder().encode(value);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      },
+    });
+    const snapshot = await probePage(parsePageUrl(START), {
+      fetch: stubFetch(() => new Response(stream, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } })),
+      userAgent: USER_AGENT,
+    });
+    expect(snapshot.body).toContain("h\u00e9llo \u2014 \u4e16\u754c &amp; more");
+    expect(snapshot.body).not.toContain("var s=1");
+    expect(snapshot.bytes).toBe(bytes.byteLength);
+    expect(snapshot.features.script.bytesRatio).toBeGreaterThan(0);
+    expect(snapshot.features.script.bytesRatio).toBeLessThan(1);
+  });
+
+  it("decodes a latin-1 body and keeps a sane upstream/ratio split", async () => {
+    const value = `<html><body><p>caf\u00e9</p><script>var a=1;</script></body></html>`;
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      bytes[index] = value.charCodeAt(index) & 0xff;
+    }
+    const snapshot = await probePage(parsePageUrl(START), {
+      fetch: stubFetch(() => new Response(bytes, { status: 200, headers: { "content-type": "text/html; charset=iso-8859-1" } })),
+      userAgent: USER_AGENT,
+    });
+    expect(snapshot.body).toContain("caf\u00e9");
+    expect(snapshot.bytes).toBe(bytes.byteLength);
+    expect(snapshot.features.script.bytesRatio).toBeGreaterThan(0);
+    expect(snapshot.features.script.bytesRatio).toBeLessThan(1);
+  });
+
+  it("removes an oversized inline data: asset and keeps the page", async () => {
+    // A single attribute this large is still buffered by HTMLRewriter before the
+    // element callback; it is filtered, so the raw size never reaches the cap.
+    const data = `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}`;
+    const scripts = `<script>${"var x=1;".repeat(150_000)}</script>`;
+    const body = `<html><body><img src="${data}"><p>Hello</p>${scripts}</body></html>`;
+    const snapshot = await probePage(parsePageUrl(START), {
+      fetch: stubFetch(() => html(body)),
+      userAgent: USER_AGENT,
+    });
+    expect(snapshot.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(snapshot.body).not.toContain("data:image");
+    expect(snapshot.body).toContain("Hello");
+  });
 });

@@ -88,7 +88,7 @@ export interface PageSnapshot {
   status: number;
   mime: string;
   body: string;
-  /** Decoded body size in bytes (observability only). */
+  /** Upstream raw byte count before filtering (observability only). */
   bytes: number;
   /** Number of redirect hops followed (observability only). */
   redirects: number;

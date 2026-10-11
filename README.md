@@ -196,7 +196,11 @@ Pipeline:
 1. SSRF validation (scheme, credentials, port 80/443, private/loopback/link-local
    hosts and IP literals, per-hop redirect checks).
 2. One probe GET (`Accept: text/markdown, text/html;q=0.9, ...`, manual
-   redirects, body cap 2 MiB). `text/markdown` / `text/plain` is returned
+   redirects). An HTML response is charset-normalised to UTF-8 and streamed
+   through one `HTMLRewriter` pass that strips non-content markup (`script`
+   except `application/ld+json`, `style`, `svg`, HTML comments and inline
+   `data:` assets) while it collects the decision evidence; the 2 MiB body cap
+   applies to this filtered HTML. `text/markdown` / `text/plain` is returned
    directly (`extraction: "source"`).
 3. One OpenRouter decisions call asking `needs_render` (`noul` in `[0,1]`).
    Missing key, non-2xx, timeout or malformed answer → `decision.source: "error"`
@@ -241,9 +245,16 @@ cooldown, and a stalled render surfaces as `RENDER_FAILED`. `ABORTED` and
 `search_topic`'s `TIMEOUT` are kept in the schemas for wire compatibility but
 are no longer emitted.
 
-Synchronous CPU work after the body is read (HTML parsing, Readability,
-Markdown conversion, feature collection) cannot be interrupted by these timers;
-it is bounded by the 2 MiB body cap.
+Synchronous CPU work after the filtered body is read (Readability, Markdown
+conversion) cannot be interrupted by these timers; it is bounded by the 2 MiB
+body cap. `HTMLRewriter` still processes every upstream byte, bounded by the
+per-hop timeout, so the cap bounds the retained string and downstream parsing
+rather than the filter pass; no separate raw-byte ceiling is added. JSON-LD is
+retained so Readability can read its title/byline/siteName metadata, while SVG
+text still contributes to the decision evidence even though the `svg` element
+is stripped from the extracted HTML. A single start tag or attribute larger
+than the rewriter's parser memory limit fails the hop (`FETCH_FAILED`);
+removing many smaller non-content nodes has no such limit.
 
 #### Browser provider residual risk
 

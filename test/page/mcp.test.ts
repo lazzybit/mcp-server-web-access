@@ -187,6 +187,44 @@ describe("runFetchPage", () => {
     expect(output.status).toBe("failed");
     expect(output.error?.code).toBe("BLOCKED_URL");
   });
+
+  it("reaches the decision and extracts a script-heavy page over the raw cap", async () => {
+    const scripts = `<script>${"var x=1;".repeat(350_000)}</script>`;
+    const html = `${article}${scripts}`;
+    expect(new TextEncoder().encode(html).byteLength).toBeGreaterThan(2 * 1024 * 1024);
+    const { deps, decisionCalls } = harness(() => htmlResponse(html), () => noulResponse(0.1));
+    const output = await runFetchPage(deps, { url: "https://example.com/docs" });
+    expect(output.status).toBe("ok");
+    expect(output.decision.source).toBe("model");
+    expect(output.rendered).toBe(false);
+    expect(output.extraction).toBe("readability");
+    expect(decisionCalls()).toBe(1);
+  });
+
+  it("keeps JSON-LD metadata for Readability", async () => {
+    const jsonLd = JSON.stringify({
+      "@context": "https://schema.org",
+      "@type": "NewsArticle",
+      headline: "LD Headline",
+      author: { "@type": "Person", name: "Jane Doe" },
+      publisher: { "@type": "Organization", name: "LD Site" },
+    });
+    const paragraph =
+      "A sufficiently long paragraph of article text to pass the readability character threshold. ".repeat(
+        10,
+      );
+    const html =
+      `<html><head><title>Fallback title</title>` +
+      `<script type="application/ld+json">${jsonLd}</script></head>` +
+      `<body><article><h1>LD Headline</h1><p>${paragraph}</p></article></body></html>`;
+    const { deps } = harness(() => htmlResponse(html), () => noulResponse(0.1));
+    const output = await runFetchPage(deps, { url: "https://example.com/news" });
+    expect(output.status).toBe("ok");
+    expect(output.extraction).toBe("readability");
+    expect(output.page.title).toBe("LD Headline");
+    expect(output.page.byline).toBe("Jane Doe");
+    expect(output.page.siteName).toBe("LD Site");
+  });
 });
 
 describe("fetch_page MCP contract", () => {

@@ -7,7 +7,7 @@
  */
 import { ACCEPT_HEADER, FETCH_ATTEMPT_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REDIRECTS } from "./constants";
 import { TimeoutError, operationWindow, withTimeout } from "./timeout";
-import { collectFeatures } from "./features";
+import { createEvidenceRewriter } from "./features";
 import { assertAllowedUrl } from "./ssrf";
 import { emptyFeatures } from "./types";
 import type { PageSnapshot } from "./types";
@@ -75,25 +75,55 @@ export async function probePage(initialUrl: URL, options: ProbeOptions): Promise
       }
 
       const { mime, charset } = parseContentType(response.headers.get("content-type"));
-      const bytes = await withTimeout(
-        readBody(response, window.signal),
+      const isMarkdownLike = mime === "text/markdown" || mime === "text/plain";
+
+      if (isMarkdownLike) {
+        const bytes = await withTimeout(
+          readBody(response, window.signal),
+          window.remaining(),
+          "the request exceeded its deadline",
+        );
+        return {
+          requestedUrl: initialUrl.href,
+          finalUrl: current.href,
+          status: response.status,
+          mime,
+          body: decodeBody(bytes, charset),
+          bytes: bytes.byteLength,
+          redirects,
+          isMarkdownLike: true,
+          features: emptyFeatures(),
+        };
+      }
+
+      // HTML is charset-normalised to UTF-8, stripped of non-content markup and
+      // only then capped: a script/style-heavy page with small readable content
+      // no longer aborts with TOO_LARGE before the decision runs.
+      const counters: ByteCounters = { upstreamBytes: 0, normalizedBytes: 0 };
+      const normalized =
+        response.body === null
+          ? null
+          : response.body.pipeThrough(normalizeToUtf8(charset, counters));
+      const { rewriter, finish } = createEvidenceRewriter();
+      const rewritten = rewriter.transform(
+        new Response(normalized, { headers: { "content-type": "text/html; charset=utf-8" } }),
+      );
+      const filtered = await withTimeout(
+        readBody(rewritten, window.signal),
         window.remaining(),
         "the request exceeded its deadline",
       );
-      const body = decodeBody(bytes, charset);
-      const isMarkdownLike = mime === "text/markdown" || mime === "text/plain";
-      const features = isMarkdownLike ? emptyFeatures() : await collectFeatures(body);
 
       return {
         requestedUrl: initialUrl.href,
         finalUrl: current.href,
         status: response.status,
         mime,
-        body,
-        bytes: bytes.byteLength,
+        body: decodeBody(filtered, "utf-8"),
+        bytes: counters.upstreamBytes,
         redirects,
-        isMarkdownLike,
-        features,
+        isMarkdownLike: false,
+        features: finish(counters.normalizedBytes),
       };
     } catch (error) {
       if (error instanceof PageFailure) throw error;
@@ -181,14 +211,55 @@ function concat(chunks: Uint8Array[], total: number): Uint8Array {
 }
 
 function decodeBody(bytes: Uint8Array, charset: string | null): string {
+  return createDecoder(charset).decode(bytes);
+}
+
+function createDecoder(charset: string | null): TextDecoder {
   if (charset !== null) {
     try {
-      return new TextDecoder(charset).decode(bytes);
+      return new TextDecoder(charset);
     } catch {
       // Unknown label: fall through to UTF-8.
     }
   }
-  return new TextDecoder("utf-8").decode(bytes);
+  return new TextDecoder("utf-8");
+}
+
+interface ByteCounters {
+  /** Raw upstream bytes seen (observability only). */
+  upstreamBytes: number;
+  /** UTF-8 bytes produced by re-encoding the decoded text. */
+  normalizedBytes: number;
+}
+
+/**
+ * Incrementally decodes with the declared charset and re-encodes to UTF-8, so
+ * the rewriter and the cap always see one encoding. `normalizedBytes` is the
+ * unfiltered, decoded HTML length used as the `bytesRatio` denominator.
+ */
+function normalizeToUtf8(
+  charset: string | null,
+  counters: ByteCounters,
+): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = createDecoder(charset);
+  const encoder = new TextEncoder();
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      counters.upstreamBytes += chunk.byteLength;
+      const text = decoder.decode(chunk, { stream: true });
+      if (text === "") return;
+      const bytes = encoder.encode(text);
+      counters.normalizedBytes += bytes.byteLength;
+      controller.enqueue(bytes);
+    },
+    flush(controller) {
+      const tail = decoder.decode();
+      if (tail === "") return;
+      const bytes = encoder.encode(tail);
+      counters.normalizedBytes += bytes.byteLength;
+      controller.enqueue(bytes);
+    },
+  });
 }
 
 async function cancelBody(response: Response): Promise<void> {
