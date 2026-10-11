@@ -1,4 +1,4 @@
-/** Shared result contract between the Worker and the `DdgService` Durable Object. */
+/** Shared result contract between the Worker and the `SearchService` Durable Object. */
 
 export type Freshness = "day" | "week" | "month" | "year";
 
@@ -21,7 +21,7 @@ export interface SearchResultItem {
 
 /**
  * Error codes kept for wire compatibility. `TIMEOUT` and `ABORTED` are no
- * longer emitted by `search_ddg`: per-operation timeouts surface as
+ * longer emitted by `search_topic`: per-operation timeouts surface as
  * `UPSTREAM_ERROR`, and there is no whole-call deadline or caller cancellation.
  */
 export type ErrorCode =
@@ -33,7 +33,8 @@ export type ErrorCode =
   | "RATE_LIMITED"
   | "PROVIDER_CHALLENGE"
   | "UPSTREAM_ERROR"
-  | "PARSE_FAILED";
+  | "PARSE_FAILED"
+  | "NO_SEARCH_PROVIDER_AVAILABLE";
 
 export interface SearchError {
   code: ErrorCode;
@@ -62,6 +63,7 @@ const RETRYABLE: Record<ErrorCode, boolean> = {
   PROVIDER_CHALLENGE: true,
   UPSTREAM_ERROR: true,
   PARSE_FAILED: true,
+  NO_SEARCH_PROVIDER_AVAILABLE: true,
 };
 
 export function isRetryable(code: ErrorCode): boolean {

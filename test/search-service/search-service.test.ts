@@ -1,6 +1,8 @@
 import { env, evictAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { DDG_OBJECT_NAME, DdgService } from "../../src/ddg-service";
+import { SearchService } from "../../src/search-service";
+import { DDG_HTML_STATE_KEY } from "../../src/search/ddg-html-provider";
+import { DDG_BROWSER_STATE_KEY } from "../../src/search/ddg-browser-provider";
 import { clickMoreResults, extractSearchDom } from "../../src/ddg/browser-search";
 import type {
   SearchBrowserLauncher,
@@ -10,7 +12,8 @@ import type {
 } from "../../src/ddg/browser-search";
 import type { ParsedPage } from "../../src/ddg/parse";
 import type { FetchLike } from "../../src/ddg/request";
-import { ManualClock, flushMicrotasks } from "./manual-clock";
+import type { SearchError, SearchResult } from "../../src/types";
+import { ManualClock, drive, flushMicrotasks } from "../ddg/manual-clock";
 
 function resultsPage(urls: string[], next: string | null): ParsedPage {
   return {
@@ -49,7 +52,10 @@ function makeBrowser(batch: SearchDomExtraction, state: FakeBrowserState): Searc
   };
 }
 
-function browserLauncher(batch: SearchDomExtraction, state: FakeBrowserState): SearchBrowserLauncher {
+function browserLauncher(
+  batch: SearchDomExtraction,
+  state: FakeBrowserState,
+): SearchBrowserLauncher {
   return async () => {
     state.launches += 1;
     return makeBrowser(batch, state);
@@ -64,16 +70,35 @@ function browserResult(url: string, hasMore: boolean): SearchDomExtraction {
   };
 }
 
-describe("DdgService", () => {
+function codeOf(result: SearchResult): string | undefined {
+  return errorOf(result)?.code;
+}
+
+function errorOf(result: SearchResult): SearchError | undefined {
+  return "error" in result ? result.error : undefined;
+}
+
+/**
+ * Each test gets its own object name: eviction clears memory but durable
+ * storage outlives it, so a shared singleton would leak provider cooldowns
+ * between tests (and make a search wait on a clock nobody drives).
+ */
+let objectCounter = 0;
+function freshStub() {
+  objectCounter += 1;
+  return env.SEARCH_SERVICE.getByName(`test-${objectCounter}`);
+}
+
+describe("SearchService", () => {
   afterEach(async () => {
     await evictAllDurableObjects();
   });
 
   it("runs a paginated search through the Durable Object", async () => {
     const clock = new ManualClock();
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
-    const result = await runInDurableObject(stub, async (instance: DdgService) => {
+    const result = await runInDurableObject(stub, async (instance: SearchService) => {
       let lastForm = new URLSearchParams();
       const fetchImpl: FetchLike = async (_input, init) => {
         lastForm = new URLSearchParams(String(init?.body ?? ""));
@@ -86,8 +111,7 @@ describe("DdgService", () => {
           lastForm.get("s") === "25"
             ? resultsPage(["https://b.example/", "https://c.example/"], null)
             : resultsPage(["https://a.example/", "https://b.example/"], "25"),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
       });
 
       return instance.search({ query: "x", maxResults: 3, region: "wt-wt" });
@@ -101,92 +125,114 @@ describe("DdgService", () => {
     ]);
   });
 
-  it("persists the cooldown after three consecutive failures and rejects the next call", async () => {
+  it("persists the HTML cooldown and reports NO_SEARCH_PROVIDER_AVAILABLE with no browser", async () => {
     const clock = new ManualClock();
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
-    const outcome = await runInDurableObject(stub, async (instance: DdgService, state) => {
+    const outcome = await runInDurableObject(stub, async (instance: SearchService, state) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
 
       const challenged = await instance.search({ query: "x", maxResults: 1, region: "wt-wt" });
-      const stored = await state.storage.get<{
-        intervalMs: number;
-        consecutiveFailures: number;
-        nextRetryAt: number;
-      }>("ddgState");
+      const stored = await state.storage.get<{ v: number; nextRetryAt: number }>(
+        DDG_HTML_STATE_KEY,
+      );
       const immediate = await instance.search({ query: "y", maxResults: 1, region: "wt-wt" });
       return { challenged, stored, immediate };
     });
 
     expect(outcome.challenged.status).toBe("failed");
-    expect("error" in outcome.challenged ? outcome.challenged.error.code : undefined).toBe(
-      "PROVIDER_CHALLENGE",
-    );
-    expect(outcome.stored?.intervalMs).toBe(0);
-    expect(outcome.stored?.consecutiveFailures).toBe(0);
+    expect(codeOf(outcome.challenged)).toBe("NO_SEARCH_PROVIDER_AVAILABLE");
+    expect(outcome.stored?.v).toBe(1);
     expect(outcome.stored?.nextRetryAt).toBe(clock.now() + 60_000);
-    expect("error" in outcome.immediate ? outcome.immediate.error.code : undefined).toBe(
-      "RATE_LIMITED",
-    );
+    expect(outcome.immediate.status).toBe("failed");
+    expect(codeOf(outcome.immediate)).toBe("NO_SEARCH_PROVIDER_AVAILABLE");
+    expect(errorOf(outcome.immediate)?.retryAfterMs).toBe(60_000);
   });
 
-  it("falls back to the browser while cooling down and keeps the engine state", async () => {
+  it("falls back to the browser within the same search", async () => {
     const clock = new ManualClock();
     const state: FakeBrowserState = { closes: 0, launches: 0 };
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
     const outcome = await runInDurableObject(stub, async (instance) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
-      await instance.search({ query: "a", maxResults: 1, region: "wt-wt" });
-      const before = instance.getNextRetryAt();
-
       instance.setTestBrowserDeps({
         launch: browserLauncher(browserResult("https://example.com/x", false), state),
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
       });
+
       const result = await instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
-      return { result, before, after: instance.getNextRetryAt() };
+      return { result, htmlNextRetryAt: instance.getNextRetryAt(), browserNextRetryAt: instance.getBrowserNextRetryAt() };
     });
 
     expect(outcome.result.status).toBe("exhausted");
     expect(outcome.result.results.map((item) => item.url)).toEqual(["https://example.com/x"]);
-    expect(outcome.after).toBe(outcome.before);
+    expect(outcome.htmlNextRetryAt).toBe(clock.now() + 60_000);
+    // A successful browser search does not open a cooldown.
+    expect(outcome.browserNextRetryAt).toBe(0);
     expect(state.closes).toBe(1);
   });
 
-  it("recomputes retryAfterMs when the fallback fails with zero results", async () => {
+  it("keeps provider state in independent namespaces", async () => {
     const clock = new ManualClock();
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const state: FakeBrowserState = { closes: 0, launches: 0 };
+    const stub = freshStub();
+
+    const outcome = await runInDurableObject(stub, async (instance, durableState) => {
+      instance.setTestDeps({
+        clock,
+        fetchImpl: async () => new Response("body", { status: 200 }),
+        parse: async () => ({ kind: "challenge" }),
+        intervalMs: 0,
+        cooldownMs: 60_000,
+      });
+      instance.setTestBrowserDeps({
+        launch: async () => {
+          state.launches += 1;
+          throw new Error("no browser available");
+        },
+      });
+      await instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
+
+      return {
+        html: await durableState.storage.get(DDG_HTML_STATE_KEY),
+        browser: await durableState.storage.get(DDG_BROWSER_STATE_KEY),
+      };
+    });
+
+    expect(outcome.html).toEqual({ v: 1, nextRetryAt: clock.now() + 60_000 });
+    expect(outcome.browser).toEqual({ v: 1, nextRetryAt: clock.now() + 1_500 });
+  });
+
+  it("returns NO_SEARCH_PROVIDER_AVAILABLE when every provider fails", async () => {
+    const clock = new ManualClock();
+    const state: FakeBrowserState = { closes: 0, launches: 0 };
+    const stub = freshStub();
 
     const outcome = await runInDurableObject(stub, async (instance) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
-      await instance.search({ query: "a", maxResults: 1, region: "wt-wt" });
-      await clock.advance(20_000);
-
       instance.setTestBrowserDeps({
         launch: async () => {
+          state.launches += 1;
           throw new Error("no browser available");
         },
       });
@@ -194,26 +240,25 @@ describe("DdgService", () => {
     });
 
     expect(outcome.status).toBe("failed");
-    expect("error" in outcome ? outcome.error.code : undefined).toBe("RATE_LIMITED");
-    expect("error" in outcome ? outcome.error.retryAfterMs : undefined).toBe(40_000);
+    expect(codeOf(outcome)).toBe("NO_SEARCH_PROVIDER_AVAILABLE");
+    // The soonest known recovery is the browser's transient cooldown.
+    expect(errorOf(outcome)?.retryAfterMs).toBe(1_500);
+    expect(state.launches).toBe(1);
   });
 
   it("returns partial browser results as interrupted", async () => {
     const clock = new ManualClock();
     const state: FakeBrowserState = { closes: 0, launches: 0 };
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
     const outcome = await runInDurableObject(stub, async (instance) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
-      await instance.search({ query: "a", maxResults: 1, region: "wt-wt" });
-
       instance.setTestBrowserDeps({
         launch: browserLauncher(browserResult("https://example.com/p", true), state),
         pollIntervalMs: 1,
@@ -225,25 +270,22 @@ describe("DdgService", () => {
 
     expect(outcome.status).toBe("interrupted");
     expect(outcome.results).toHaveLength(1);
-    expect("error" in outcome ? outcome.error.code : undefined).toBe("PAGE_LIMIT");
+    expect(codeOf(outcome)).toBe("PAGE_LIMIT");
   });
 
-  it("continues the FIFO after a failed fallback", async () => {
+  it("continues the FIFO after a failed search", async () => {
     const clock = new ManualClock();
     const state: FakeBrowserState = { closes: 0, launches: 0 };
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
     const outcome = await runInDurableObject(stub, async (instance) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
-      await instance.search({ query: "a", maxResults: 1, region: "wt-wt" });
-
       instance.setTestBrowserDeps({
         launch: async () => {
           state.launches += 1;
@@ -255,35 +297,33 @@ describe("DdgService", () => {
       });
       const first = instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
       const second = instance.search({ query: "y", maxResults: 5, region: "wt-wt" });
-      return { first: await first, second: await second };
+      const [firstResult, secondResult] = await drive(clock, Promise.all([first, second]));
+      return { first: firstResult, second: secondResult };
     });
 
     expect(outcome.first.status).toBe("failed");
-    expect("error" in outcome.first ? outcome.first.error.code : undefined).toBe("RATE_LIMITED");
+    expect(codeOf(outcome.first)).toBe("NO_SEARCH_PROVIDER_AVAILABLE");
     expect(outcome.second.status).toBe("exhausted");
     expect(state.launches).toBe(2);
   });
 
-  it("serializes concurrent fallbacks", async () => {
+  it("serializes concurrent browser searches", async () => {
     const clock = new ManualClock();
     const state: FakeBrowserState = { closes: 0, launches: 0 };
     let releaseFirst: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    const stub = env.DDG_SERVICE.getByName(DDG_OBJECT_NAME);
+    const stub = freshStub();
 
     const outcome = await runInDurableObject(stub, async (instance) => {
       instance.setTestDeps({
         clock,
         fetchImpl: async () => new Response("body", { status: 200 }),
         parse: async () => ({ kind: "challenge" }),
-        minIntervalMs: 0,
-        maxIntervalMs: 0,
+        intervalMs: 0,
         cooldownMs: 60_000,
       });
-      await instance.search({ query: "a", maxResults: 1, region: "wt-wt" });
-
       instance.setTestBrowserDeps({
         launch: async () => {
           state.launches += 1;

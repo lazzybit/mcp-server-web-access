@@ -15,7 +15,9 @@ export default defineConfig({
     include: [
       "test/ddg/request.test.ts",
       "test/ddg/browser-search.test.ts",
-      "test/ddg-service/engine.test.ts",
+      "test/ddg/ddg-html-provider.test.ts",
+      "test/ddg/ddg-browser-provider.test.ts",
+      "test/ddg/coordinator.test.ts",
       "test/access/*.test.ts",
       "test/mcp/contract.test.ts",
       "test/page/ssrf.test.ts",

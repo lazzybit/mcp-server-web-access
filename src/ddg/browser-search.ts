@@ -1,10 +1,10 @@
 /**
- * Browser fallback for `search_ddg` while the HTTP engine is cooling down.
+ * Browser search transport used by the `ddg-browser` search provider.
  *
- * The engine stays free of `cloudflare:workers`; this adapter owns the Browser
- * Run binding. It launches at most one browser per fallback, bounds every
+ * The provider layer stays free of `cloudflare:workers`; this adapter owns the
+ * Browser Run binding. It launches at most one browser per search, bounds every
  * potentially hanging operation with its own timeout, and never touches the
- * engine's pacing/cooldown state.
+ * coordinator's provider-selection state.
  *
  * Like `fetch_page`'s renderer, there is no whole-call deadline: termination
  * comes from bounded counts plus per-operation timeouts. The in-page

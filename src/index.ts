@@ -1,9 +1,9 @@
 import { AuthenticationError, authenticate } from "./access";
 import { createWebSearchHandler } from "./mcp";
-import { DdgService, DDG_OBJECT_NAME } from "./ddg-service";
+import { SearchService, SEARCH_OBJECT_NAME } from "./search-service";
 import type { SearchParams, SearchResult } from "./types";
 
-export { DdgService };
+export { SearchService };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -26,7 +26,7 @@ export default {
     const handler = createWebSearchHandler(
       {
         search: (params: SearchParams): Promise<SearchResult> =>
-          env.DDG_SERVICE.getByName(DDG_OBJECT_NAME).search(params) as unknown as Promise<SearchResult>,
+          env.SEARCH_SERVICE.getByName(SEARCH_OBJECT_NAME).search(params) as unknown as Promise<SearchResult>,
         page: {
           // Public egress only: the search VPC binding is deliberately not used.
           fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),

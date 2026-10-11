@@ -1,4 +1,4 @@
-import type { CancelTimer, Clock } from "../../src/ddg/engine";
+import type { CancelTimer, Clock } from "../../src/search/deps";
 
 interface Sleeper {
   at: number;

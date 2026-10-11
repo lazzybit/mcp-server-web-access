@@ -4,7 +4,7 @@ import {
   initialFields,
   requestPage,
 } from "../../src/ddg/request";
-import { ManualClock } from "../ddg-service/manual-clock";
+import { ManualClock } from "./manual-clock";
 
 describe("initialFields", () => {
   it("starts with q/b/kl", () => {

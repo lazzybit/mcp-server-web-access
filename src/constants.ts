@@ -1,20 +1,12 @@
 /** Fixed tuning values. Program constants, not environment variables. */
 
-/** Lower clamp for the adaptive interval between upstream dispatches. */
-export const MIN_INTERVAL_MS = 5_000;
-/** Upper clamp for the adaptive interval between upstream dispatches. */
-export const MAX_INTERVAL_MS = 20_000;
-/** Multiplier applied to the pacing interval after an upstream failure (`a`). */
-export const INTERVAL_INCREASE_FACTOR = 2;
-/** Multiplier applied to the pacing interval after an upstream success (`b = 0.7071`). */
-export const INTERVAL_DECREASE_FACTOR = 0.7071;
-/** Consecutive upstream failures required before entering cooldown. */
-export const FAILURE_THRESHOLD = 3;
+/** Fixed minimum between dispatch starts for the HTML search provider. */
+export const PROVIDER_INTERVAL_MS = 5_000;
 /** Upper bound for a single upstream request. */
 export const ATTEMPT_TIMEOUT_MS = 10_000;
-/** `nextRetryAt` delay after the third consecutive provider challenge / rate limit. */
+/** `nextRetryAt` delay after a provider challenge / rate limit. */
 export const COOLDOWN_MS = 1_800_000;
-/** `nextRetryAt` delay after the third consecutive non-challenge upstream failure. */
+/** `nextRetryAt` delay after a non-challenge provider failure. */
 export const TRANSIENT_DELAY_MS = 1_500;
 /** When the cooldown remainder is at most this, an admitted search waits it out in place. */
 export const COOLDOWN_WAIT_MAX_MS = 10_000;

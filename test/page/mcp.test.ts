@@ -207,7 +207,7 @@ describe("fetch_page MCP contract", () => {
     try {
       const tools = await client.listTools();
       const names = tools.tools.map((tool) => tool.name);
-      expect(names).toContain("search_ddg");
+      expect(names).toContain("search_topic");
       expect(names).toContain(FETCH_PAGE_TOOL_NAME);
 
       const result = await client.callTool({

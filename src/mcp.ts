@@ -16,21 +16,22 @@ import type { SearchParams, SearchResult } from "./types";
 
 export const SERVER_NAME = "mcp-server-web-access";
 export const SERVER_VERSION = "0.1.0";
-export const SEARCH_DDG_TOOL_NAME = "search_ddg";
+export const SEARCH_TOPIC_TOOL_NAME = "search_topic";
 
 export const SERVER_INSTRUCTIONS =
-  "Web access tools. Call search_ddg with a query and the number of results " +
+  "Web access tools. Call search_topic with a query and the number of results " +
   "you want; the server paginates and deduplicates internally and preserves " +
   "partial results with an explicit status when interrupted. Call fetch_page " +
   "with a URL to get the page's readable content as Markdown or plain text; " +
   "the server decides whether a JavaScript render is needed and returns the " +
   "full content untruncated.";
 
-export const SEARCH_DDG_DESCRIPTION =
-  "Search the web with DuckDuckGo and return up to 50 structured results. " +
-  "The server paginates internally and deduplicates URLs; callers only specify " +
-  "how many results they want. Returns partial results with an explicit status " +
-  "when interrupted.";
+export const SEARCH_TOPIC_DESCRIPTION =
+  "Search the web and return up to 50 structured results. The server selects a " +
+  "search provider, falls back to another when the current one is challenged " +
+  "or unavailable, paginates internally and deduplicates URLs; callers only " +
+  "specify how many results they want. Returns partial results with an explicit " +
+  "status when interrupted.";
 
 export const REGION_PATTERN = /^([a-z]{2}-[a-z]{2}|wt-wt)$/;
 
@@ -64,6 +65,7 @@ const errorCodeSchema = z.enum([
   "PROVIDER_CHALLENGE",
   "UPSTREAM_ERROR",
   "PARSE_FAILED",
+  "NO_SEARCH_PROVIDER_AVAILABLE",
 ]);
 
 const searchErrorSchema = z.object({
@@ -117,7 +119,7 @@ function inputJsonSchema(): Record<string, unknown> {
   return inputJsonSchemaOf(webSearchInputSchema);
 }
 
-/** Builds the MCP server with `search_ddg` and `fetch_page`. */
+/** Builds the MCP server with `search_topic` and `fetch_page`. */
 export function buildServer(deps: ServerDeps, principal?: RequestPrincipal): McpServer {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
@@ -125,10 +127,10 @@ export function buildServer(deps: ServerDeps, principal?: RequestPrincipal): Mcp
   );
 
   server.registerTool(
-    SEARCH_DDG_TOOL_NAME,
+    SEARCH_TOPIC_TOOL_NAME,
     {
       title: "Web Search",
-      description: SEARCH_DDG_DESCRIPTION,
+      description: SEARCH_TOPIC_DESCRIPTION,
       inputSchema: advertisedSchema(inputJsonSchema()),
       outputSchema: webSearchOutputSchema,
       annotations: { readOnlyHint: true, openWorldHint: true },
@@ -136,7 +138,7 @@ export function buildServer(deps: ServerDeps, principal?: RequestPrincipal): Mcp
     async (rawArgs: unknown): Promise<CallToolResult> => {
       if (principal !== undefined) {
         // Operational counter only; never log the query string.
-        console.log(JSON.stringify({ event: "search_ddg_tool", subject: principal.subject }));
+        console.log(JSON.stringify({ event: "search_topic_tool", subject: principal.subject }));
       }
       const output = await runWebSearch(deps, rawArgs);
       return toCallToolResult(output);

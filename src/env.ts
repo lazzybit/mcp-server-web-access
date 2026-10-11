@@ -18,6 +18,6 @@ export interface AppEnv {
    * `"false"` test binding and runtime comparisons type-check.
    */
   BROWSER_ENABLED?: string;
-  /** Browser Run binding used by the `search_ddg` fallback and `fetch_page`. */
+  /** Browser Run binding used by the `search_topic` browser provider and `fetch_page`. */
   BROWSER?: unknown;
 }

@@ -182,7 +182,7 @@ describe("MCP server", () => {
     return { client, server };
   }
 
-  it("lists search_ddg and calls it", async () => {
+  it("lists search_topic and calls it", async () => {
     const { client, server } = await connect({
       search: async (): Promise<SearchResult> => ({
         status: "ok",
@@ -193,10 +193,10 @@ describe("MCP server", () => {
     });
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toContain("search_ddg");
+      expect(tools.tools.map((tool) => tool.name)).toContain("search_topic");
 
       const result = await client.callTool({
-        name: "search_ddg",
+        name: "search_topic",
         arguments: { query: "alpha", maxResults: 1 },
       });
       expect(result.isError).toBeFalsy();
@@ -216,7 +216,7 @@ describe("MCP server", () => {
     });
     try {
       const result = await client.callTool({
-        name: "search_ddg",
+        name: "search_topic",
         arguments: { query: "", maxResults: 999 },
       });
       expect(result.isError).toBe(true);
