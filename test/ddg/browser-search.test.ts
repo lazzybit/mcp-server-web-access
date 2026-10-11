@@ -7,12 +7,15 @@ import {
   searchViaBrowser,
 } from "../../src/ddg/browser-search";
 import type {
-  SearchBrowserLike,
-  SearchBrowserLauncher,
   SearchDomDocument,
   SearchDomExtraction,
-  SearchPageLike,
 } from "../../src/ddg/browser-search";
+import { serializeExpression } from "../../src/browser/launcher";
+import type {
+  BrowserCapability,
+  CapabilityLauncher,
+  PageCapability,
+} from "../../src/browser/launcher";
 
 function dom(html: string): SearchDomDocument {
   return parseHTML(html).document as unknown as SearchDomDocument;
@@ -54,7 +57,7 @@ function results(
   };
 }
 
-class FakeSearchPage implements SearchPageLike {
+class FakeSearchPage implements PageCapability {
   evaluates = 0;
   #batches: SearchDomExtraction[];
   #index = 0;
@@ -63,25 +66,33 @@ class FakeSearchPage implements SearchPageLike {
     this.#batches = batches;
   }
 
-  async goto(): Promise<unknown> {
+  async goto(): Promise<void> {
     return undefined;
   }
 
-  async evaluate<T>(fn: () => T): Promise<T> {
+  async content(): Promise<string> {
+    return "";
+  }
+
+  async url(): Promise<string> {
+    return "about:blank";
+  }
+
+  async evaluate(expression: string): Promise<unknown> {
     this.evaluates += 1;
-    if ((fn as unknown) === extractSearchDom) {
+    if (expression === serializeExpression(extractSearchDom)) {
       const batch = this.#batches[Math.min(this.#index, this.#batches.length - 1)];
-      return (batch ?? { kind: "unparseable" }) as unknown as T;
+      return batch ?? { kind: "unparseable" };
     }
-    if ((fn as unknown) === clickMoreResults) {
+    if (expression === serializeExpression(clickMoreResults)) {
       this.#index += 1;
-      return true as unknown as T;
+      return true;
     }
     throw new Error("unexpected evaluate");
   }
 }
 
-class FakeSearchBrowser implements SearchBrowserLike {
+class FakeSearchBrowser implements BrowserCapability {
   closes = 0;
   readonly page: FakeSearchPage;
 
@@ -89,7 +100,7 @@ class FakeSearchBrowser implements SearchBrowserLike {
     this.page = page;
   }
 
-  async newPage(): Promise<SearchPageLike> {
+  async newPage(): Promise<PageCapability> {
     return this.page;
   }
 
@@ -291,11 +302,11 @@ describe("searchViaBrowser", () => {
 
   it("closes a launch that resolves after its timeout", async () => {
     let closed = 0;
-    const launcher: SearchBrowserLauncher = () =>
+    const launcher: CapabilityLauncher = () =>
       new Promise((resolve) => {
         setTimeout(() => {
           resolve({
-            newPage: async (): Promise<SearchPageLike> => {
+            newPage: async (): Promise<PageCapability> => {
               throw new Error("unused");
             },
             close: async () => {
@@ -316,7 +327,7 @@ describe("searchViaBrowser", () => {
 
   it("gives up on a hanging close without blocking the result", async () => {
     const page = new FakeSearchPage([results([{ href: "https://example.com/a" }], false)]);
-    const browser: SearchBrowserLike = {
+    const browser: BrowserCapability = {
       newPage: async () => page,
       close: () => new Promise<void>(() => {}),
     };
@@ -329,15 +340,21 @@ describe("searchViaBrowser", () => {
   });
 
   it("bounds an evaluate that ignores abort", async () => {
-    const page: SearchPageLike = {
+    const page: PageCapability = {
       async goto() {
         return undefined;
       },
-      async evaluate<T>(): Promise<T> {
-        return new Promise<T>(() => {});
+      async content() {
+        return "";
+      },
+      async url() {
+        return "about:blank";
+      },
+      async evaluate(): Promise<unknown> {
+        return new Promise<unknown>(() => {});
       },
     };
-    const browser: SearchBrowserLike = { newPage: async () => page, close: async () => {} };
+    const browser: BrowserCapability = { newPage: async () => page, close: async () => {} };
     const outcome = await searchViaBrowser(
       { query: "q", maxResults: 5, region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, resultsTimeoutMs: 20 },
@@ -347,18 +364,24 @@ describe("searchViaBrowser", () => {
   });
 
   it("bounds a hanging click and keeps partial results", async () => {
-    const page: SearchPageLike = {
+    const page: PageCapability = {
       async goto() {
         return undefined;
       },
-      async evaluate<T>(fn: () => T): Promise<T> {
-        if ((fn as unknown) === extractSearchDom) {
-          return results([{ href: "https://example.com/a" }], true) as unknown as T;
+      async content() {
+        return "";
+      },
+      async url() {
+        return "about:blank";
+      },
+      async evaluate(expression: string): Promise<unknown> {
+        if (expression === serializeExpression(extractSearchDom)) {
+          return results([{ href: "https://example.com/a" }], true);
         }
-        return new Promise<T>(() => {});
+        return new Promise<unknown>(() => {});
       },
     };
-    const browser: SearchBrowserLike = { newPage: async () => page, close: async () => {} };
+    const browser: BrowserCapability = { newPage: async () => page, close: async () => {} };
     const outcome = await searchViaBrowser(
       { query: "q", maxResults: 5, region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, pollIntervalMs: 1, resultsTimeoutMs: 30 },
@@ -378,5 +401,21 @@ describe("searchViaBrowser", () => {
     expect(outcome.result.status).toBe("interrupted");
     expect(outcome.result.results).toHaveLength(1);
     expect("error" in outcome.result ? outcome.result.error.code : undefined).toBe("UPSTREAM_ERROR");
+  });
+});
+
+describe("in-page function serialization", () => {
+  it("keeps the extraction and click functions self-contained", () => {
+    // Rebuilding each function from source proves it closes over no module
+    // bindings; a missing binding would throw a ReferenceError here.
+    const extract = new Function(
+      `return (${extractSearchDom.toString()})`,
+    )() as (doc: SearchDomDocument) => SearchDomExtraction;
+    expect(extract(dom(resultHtml())).kind).toBe("results");
+
+    const click = new Function(
+      `return (${clickMoreResults.toString()})`,
+    )() as (doc: SearchDomDocument) => boolean;
+    expect(click(dom(`<html><body><button>More results</button></body></html>`))).toBe(true);
   });
 });

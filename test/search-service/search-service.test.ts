@@ -4,12 +4,13 @@ import { SearchService } from "../../src/search-service";
 import { DDG_HTML_STATE_KEY } from "../../src/search/ddg-html-provider";
 import { DDG_BROWSER_STATE_KEY } from "../../src/search/ddg-browser-provider";
 import { clickMoreResults, extractSearchDom } from "../../src/ddg/browser-search";
+import type { SearchDomExtraction } from "../../src/ddg/browser-search";
+import { serializeExpression } from "../../src/browser/launcher";
 import type {
-  SearchBrowserLauncher,
-  SearchBrowserLike,
-  SearchDomExtraction,
-  SearchPageLike,
-} from "../../src/ddg/browser-search";
+  BrowserCapability,
+  CapabilityLauncher,
+  PageCapability,
+} from "../../src/browser/launcher";
 import type { ParsedPage } from "../../src/ddg/parse";
 import type { FetchLike } from "../../src/ddg/request";
 import type { SearchError, SearchResult } from "../../src/types";
@@ -33,14 +34,20 @@ interface FakeBrowserState {
   launches: number;
 }
 
-function makeBrowser(batch: SearchDomExtraction, state: FakeBrowserState): SearchBrowserLike {
-  const page: SearchPageLike = {
+function makeBrowser(batch: SearchDomExtraction, state: FakeBrowserState): BrowserCapability {
+  const page: PageCapability = {
     async goto() {
       return undefined;
     },
-    async evaluate<T>(fn: () => T): Promise<T> {
-      if ((fn as unknown) === extractSearchDom) return batch as unknown as T;
-      if ((fn as unknown) === clickMoreResults) return false as unknown as T;
+    async content() {
+      return "";
+    },
+    async url() {
+      return "about:blank";
+    },
+    async evaluate(expression: string): Promise<unknown> {
+      if (expression === serializeExpression(extractSearchDom)) return batch;
+      if (expression === serializeExpression(clickMoreResults)) return false;
       throw new Error("unexpected evaluate");
     },
   };
@@ -55,7 +62,7 @@ function makeBrowser(batch: SearchDomExtraction, state: FakeBrowserState): Searc
 function browserLauncher(
   batch: SearchDomExtraction,
   state: FakeBrowserState,
-): SearchBrowserLauncher {
+): CapabilityLauncher {
   return async () => {
     state.launches += 1;
     return makeBrowser(batch, state);

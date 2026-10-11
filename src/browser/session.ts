@@ -1,81 +1,82 @@
 /**
- * Shared-session launcher used by both browser call sites.
+ * Reusable Browser Run session.
  *
- * The `BrowserService` Durable Object is a session broker: it only resolves one
- * reusable Browser Run `sessionId`. This module turns that id into the small
- * launcher surface `fetch_page`'s renderer and the `ddg-browser` search already
- * expect, while isolating every operation in its own incognito browser context.
+ * One cached CDP connection is retained in memory for the lifetime of the
+ * Durable Object instance and shared by every operation; each operation gets
+ * its own incognito context, so cookies and storage never leak. The session id
+ * is never persisted: after eviction or `keep_alive` expiry the next operation
+ * acquires a new one.
  *
- * It deliberately stays free of `cloudflare:workers` so it can run in the
- * Node-only test project; `@cloudflare/puppeteer` is imported lazily and can be
- * replaced through {@link SessionLauncherOptions.connect}.
+ * Every potentially hanging RPC is bounded, and cleanup is bounded too. A
+ * connection that is no longer `connected` is invalidated by identity and
+ * replaced once; only a failed context creation on an established connection
+ * loss is retried, and navigation is never replayed.
  *
- * Cleanup never closes the shared browser: it closes this operation's context
- * and disconnects its own CDP connection. Closing the browser would evict the
- * session for everyone else.
+ * The module deliberately stays free of `cloudflare:workers` so it can run in
+ * the Node-only test project; `@cloudflare/puppeteer` is imported lazily and
+ * can be replaced through {@link ReusableBrowserSession.setClient}.
  */
 import {
   BROWSER_CALL_TIMEOUT_MS,
   BROWSER_CLOSE_TIMEOUT_MS,
+  BROWSER_KEEP_ALIVE_MS,
   BROWSER_LAUNCH_TIMEOUT_MS,
 } from "../page/constants";
 import { withTimeout } from "../page/timeout";
-import type { PageLike } from "../page/browser";
-import type { SearchPageLike } from "../ddg/browser-search";
 
-/** Outcome of one broker lookup. */
-export type SessionResult = { ok: true; sessionId: string } | { ok: false; message: string };
-
-/**
- * The broker surface the launcher depends on. Implemented by the
- * `BrowserService` Durable Object; a stub cannot import `cloudflare:workers`.
- */
-export interface BrowserSessionBroker {
-  /**
-   * Returns a reusable session id.
-   *
-   * @param previousSessionId The id the caller just failed to use, when any.
-   * A broker may return the same id (still alive) or a replacement.
-   */
-  getSession(previousSessionId?: string): Promise<SessionResult>;
-}
-
-/** The page surface shared by both launchers. */
-export type SessionPage = PageLike & SearchPageLike;
-
-/** One incognito context. */
-export interface SessionContextLike {
-  newPage(): Promise<SessionPage>;
-  close(): Promise<void>;
-}
-
-/** A CDP connection to the shared session. */
-export interface ConnectedSessionBrowser {
-  createBrowserContext(): Promise<SessionContextLike>;
+/** The subset of Puppeteer `Browser` the reusable session needs. */
+export interface ReusableBrowser {
+  readonly connected: boolean;
+  createBrowserContext(): Promise<ReusableContext>;
   disconnect(): Promise<void>;
 }
 
-/** Injectable connect seam; defaults to `puppeteer.connect`. */
-export type SessionConnect = (
-  binding: unknown,
-  sessionId: string,
-) => Promise<ConnectedSessionBrowser>;
-
-/** The launcher both `BrowserLauncher` and `SearchBrowserLauncher` accept. */
-export interface SessionBrowserLike {
-  newPage(): Promise<SessionPage>;
+/** The subset of Puppeteer `BrowserContext` the reusable session needs. */
+export interface ReusableContext {
+  newPage(): Promise<ReusablePage>;
   close(): Promise<void>;
 }
 
-export type SessionLauncher = (binding: unknown) => Promise<SessionBrowserLike>;
+/** The subset of Puppeteer `Page` the browser capability wraps. */
+export interface ReusablePage {
+  goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
+  content(): Promise<string>;
+  url(): string;
+  setRequestInterception(value: boolean): Promise<void>;
+  on(event: "request", handler: (request: ReusableRequest) => void): unknown;
+  evaluate(expression: string): Promise<unknown>;
+  setUserAgent?(value: string): Promise<void>;
+  setViewport?(viewport: { readonly width: number; readonly height: number }): Promise<void>;
+  setExtraHTTPHeaders?(headers: Record<string, string>): Promise<void>;
+}
 
-export interface SessionLauncherOptions {
-  broker: BrowserSessionBroker;
-  /** The `BROWSER` binding captured for the whole launcher lifetime. */
+/** The subset of Puppeteer `HTTPRequest` interception uses. */
+export interface ReusableRequest {
+  isNavigationRequest(): boolean;
+  url(): string;
+  redirectChain(): ReusableRequest[];
+  continue(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+/**
+ * Injectable Browser Run client. The default implementation lazily imports
+ * `@cloudflare/puppeteer`; tests and the Durable Object inject their own.
+ */
+export interface BrowserSessionClient {
+  acquire(binding: unknown, options: { keep_alive: number }): Promise<{ sessionId: string }>;
+  connect(binding: unknown, sessionId: string): Promise<ReusableBrowser>;
+}
+
+/** Construction seams for {@link ReusableBrowserSession}. */
+export interface ReusableBrowserSessionOptions {
+  /** The `BROWSER` binding captured for the whole session lifetime. */
   binding: unknown;
   /** Test/override hook; defaults to `@cloudflare/puppeteer`. */
-  connect?: SessionConnect;
-  /** Bounds session acquisition. Defaults to `BROWSER_LAUNCH_TIMEOUT_MS`. */
+  client?: BrowserSessionClient;
+  /** Idle window handed to Browser Run. Defaults to `BROWSER_KEEP_ALIVE_MS`. */
+  keepAliveMs?: number;
+  /** Bounds acquisition. Defaults to `BROWSER_LAUNCH_TIMEOUT_MS`. */
   launchTimeoutMs?: number;
   /** Bounds connect and context creation. Defaults to `BROWSER_CALL_TIMEOUT_MS`. */
   callTimeoutMs?: number;
@@ -83,7 +84,6 @@ export interface SessionLauncherOptions {
   closeTimeoutMs?: number;
 }
 
-/** Tuning passed down to the connect/refresh helpers. */
 interface SessionTimeouts {
   launchTimeoutMs: number;
   callTimeoutMs: number;
@@ -91,134 +91,167 @@ interface SessionTimeouts {
 }
 
 /**
- * Builds a launcher that resolves the shared session and opens one incognito
- * context per call. The returned object satisfies both call sites' launcher
- * types; the `binding` argument is ignored in favour of the captured binding.
+ * Retains one Browser Run connection and opens one incognito context per
+ * operation. Safe to share: concurrent operations reuse the same connection
+ * but never the same context.
  */
-export function createSessionLauncher(options: SessionLauncherOptions): SessionLauncher {
-  const timeouts: SessionTimeouts = {
-    launchTimeoutMs: options.launchTimeoutMs ?? BROWSER_LAUNCH_TIMEOUT_MS,
-    callTimeoutMs: options.callTimeoutMs ?? BROWSER_CALL_TIMEOUT_MS,
-    closeTimeoutMs: options.closeTimeoutMs ?? BROWSER_CLOSE_TIMEOUT_MS,
-  };
-  const broker = options.broker;
-  const binding = options.binding;
+export class ReusableBrowserSession {
+  #client: BrowserSessionClient | null;
+  #browser: ReusableBrowser | null = null;
+  /** One in-flight acquisition/connect shared by all concurrent callers. */
+  #connecting: Promise<ReusableBrowser> | null = null;
+  readonly #binding: unknown;
+  readonly #keepAliveMs: number;
+  readonly #timeouts: SessionTimeouts;
 
-  return async () => {
-    const session = await acquireSession(broker, timeouts.launchTimeoutMs);
-    const connect = await resolveConnect(options.connect);
-    const browser = await connectWithRefresh(
-      connect,
-      broker,
-      binding,
-      session.sessionId,
-      timeouts,
+  constructor(options: ReusableBrowserSessionOptions) {
+    this.#binding = options.binding;
+    this.#client = options.client ?? null;
+    this.#keepAliveMs = options.keepAliveMs ?? BROWSER_KEEP_ALIVE_MS;
+    this.#timeouts = {
+      launchTimeoutMs: options.launchTimeoutMs ?? BROWSER_LAUNCH_TIMEOUT_MS,
+      callTimeoutMs: options.callTimeoutMs ?? BROWSER_CALL_TIMEOUT_MS,
+      closeTimeoutMs: options.closeTimeoutMs ?? BROWSER_CLOSE_TIMEOUT_MS,
+    };
+  }
+
+  /** Test-only seam: replace the `@cloudflare/puppeteer` client. */
+  setClient(client: BrowserSessionClient): void {
+    this.#client = client;
+  }
+
+  /**
+   * Opens one incognito context on the shared connection. On a failed context
+   * creation it recovers at most once, and only when the connection is known
+   * to be lost.
+   */
+  async openContext(): Promise<ReusableContext> {
+    const browser = await this.#current();
+    try {
+      return await this.#createContext(browser);
+    } catch (error) {
+      if (browser.connected) throw error;
+      // The cached connection dropped mid-operation; reconnect once. The
+      // domain layer owns navigation, so nothing is replayed here.
+      const refreshed = await this.#current();
+      return this.#createContext(refreshed);
+    }
+  }
+
+  /**
+   * Returns the cached connection when it is still connected; otherwise
+   * invalidates it and acquires a replacement. A single in-flight
+   * acquisition/connect is shared by all concurrent callers.
+   */
+  async #current(): Promise<ReusableBrowser> {
+    const cached = this.#browser;
+    if (cached !== null) {
+      if (cached.connected) return cached;
+      this.#invalidate(cached);
+    }
+    return this.#connect();
+  }
+
+  #connect(): Promise<ReusableBrowser> {
+    if (this.#connecting !== null) return this.#connecting;
+    const promise = this.#acquireAndConnect().finally(() => {
+      if (this.#connecting === promise) this.#connecting = null;
+    });
+    this.#connecting = promise;
+    return promise;
+  }
+
+  async #acquireAndConnect(): Promise<ReusableBrowser> {
+    const client = await this.#getClient();
+    const session = await withTimeout(
+      client.acquire(this.#binding, { keep_alive: this.#keepAliveMs }),
+      this.#timeouts.launchTimeoutMs,
+      "browser session acquisition timed out",
     );
 
-    const contextPromise = browser.createBrowserContext();
-    let context: SessionContextLike;
+    const connectPromise = client.connect(this.#binding, session.sessionId);
+    let browser: ReusableBrowser;
     try {
-      context = await withTimeout(contextPromise, timeouts.callTimeoutMs, "browser context timed out");
+      browser = await withTimeout(
+        connectPromise,
+        this.#timeouts.callTimeoutMs,
+        "browser connect timed out",
+      );
     } catch (error) {
-      // A context that resolves after its timeout still gets closed; the
-      // handler is attached before the disconnect so it can reach Chrome.
-      void contextPromise
-        .then((late) => closeBounded(late, timeouts.closeTimeoutMs))
+      // A connection that resolves after its timeout must still be released.
+      void connectPromise
+        .then((late) => this.#disconnect(late))
         .catch(() => undefined);
-      await disconnectBounded(browser, timeouts.closeTimeoutMs);
       throw error;
     }
-
-    return {
-      newPage: () => context.newPage(),
-      close: async () => {
-        await closeBounded(context, timeouts.closeTimeoutMs);
-        await disconnectBounded(browser, timeouts.closeTimeoutMs);
-      },
-    };
-  };
-}
-
-/** Asks the broker for a session; a broker failure aborts the operation. */
-async function acquireSession(
-  broker: BrowserSessionBroker,
-  ms: number,
-  previousSessionId?: string,
-): Promise<{ ok: true; sessionId: string }> {
-  let result: SessionResult;
-  try {
-    result = await withTimeout(
-      broker.getSession(previousSessionId),
-      ms,
-      "browser session timed out",
-    );
-  } catch {
-    throw new Error("browser session timed out");
+    this.#browser = browser;
+    return browser;
   }
-  if (!result.ok) throw new Error(result.message);
-  return result;
-}
 
-/**
- * Connects once and, on failure, asks the broker to refresh exactly once.
- * A replacement is only tried when the broker actually returns a different id,
- * so a genuinely dead session is never connected to twice.
- */
-async function connectWithRefresh(
-  connect: SessionConnect,
-  broker: BrowserSessionBroker,
-  binding: unknown,
-  sessionId: string,
-  timeouts: SessionTimeouts,
-): Promise<ConnectedSessionBrowser> {
-  const first = connect(binding, sessionId);
-  try {
-    return await withTimeout(first, timeouts.callTimeoutMs, "browser connect timed out");
-  } catch (error) {
-    // A connection that resolves after its timeout must still be released.
-    void first
-      .then((late) => disconnectBounded(late, timeouts.closeTimeoutMs))
-      .catch(() => undefined);
-    const refreshed = await acquireSession(broker, timeouts.launchTimeoutMs, sessionId);
-    if (refreshed.sessionId === sessionId) throw error;
-
-    const second = connect(binding, refreshed.sessionId);
+  async #createContext(browser: ReusableBrowser): Promise<ReusableContext> {
+    const contextPromise = browser.createBrowserContext();
     try {
-      return await withTimeout(second, timeouts.callTimeoutMs, "browser connect timed out");
-    } catch (retryError) {
-      void second
-        .then((late) => disconnectBounded(late, timeouts.closeTimeoutMs))
+      return await withTimeout(
+        contextPromise,
+        this.#timeouts.callTimeoutMs,
+        "browser context timed out",
+      );
+    } catch (error) {
+      // A context that resolves after its timeout must still be closed.
+      void contextPromise
+        .then((late) => this.#closeContext(late))
         .catch(() => undefined);
-      throw retryError;
+      throw error;
     }
   }
+
+  /** Drops a stale cached connection without touching a newer replacement. */
+  #invalidate(browser: ReusableBrowser): void {
+    if (this.#browser === browser) this.#browser = null;
+    void this.#disconnect(browser);
+  }
+
+  async #disconnect(browser: ReusableBrowser): Promise<void> {
+    try {
+      await withTimeout(
+        browser.disconnect(),
+        this.#timeouts.closeTimeoutMs,
+        "browser disconnect timed out",
+      );
+    } catch {
+      // Giving up on disconnect must not block the result.
+    }
+  }
+
+  async #closeContext(context: ReusableContext): Promise<void> {
+    try {
+      await withTimeout(
+        context.close(),
+        this.#timeouts.closeTimeoutMs,
+        "browser context close timed out",
+      );
+    } catch {
+      // Giving up on close must not block the result.
+    }
+  }
+
+  async #getClient(): Promise<BrowserSessionClient> {
+    if (this.#client !== null) return this.#client;
+    return defaultBrowserSessionClient();
+  }
 }
 
-async function resolveConnect(provided?: SessionConnect): Promise<SessionConnect> {
-  if (provided !== undefined) return provided;
+/** Lazily loads the real Browser Run client. */
+async function defaultBrowserSessionClient(): Promise<BrowserSessionClient> {
   const module = await import("@cloudflare/puppeteer");
-  const connect = module.default.connect;
-  return (binding: unknown, sessionId: string) =>
-    connect(binding as never, sessionId) as unknown as Promise<ConnectedSessionBrowser>;
-}
-
-/** Closes a context under a bound; a slow or hanging close never blocks. */
-async function closeBounded(context: SessionContextLike, ms: number): Promise<void> {
-  try {
-    await withTimeout(context.close(), ms, "browser context close timed out");
-  } catch {
-    // Giving up on close must not block the result.
-  }
-}
-
-/** Disconnects this operation's CDP connection under a bound. */
-async function disconnectBounded(
-  browser: ConnectedSessionBrowser,
-  ms: number,
-): Promise<void> {
-  try {
-    await withTimeout(browser.disconnect(), ms, "browser disconnect timed out");
-  } catch {
-    // Giving up on disconnect must not block the result.
-  }
+  const puppeteer = module.default;
+  return {
+    acquire: (binding, options) =>
+      puppeteer.acquire(binding as never, options) as Promise<{ sessionId: string }>,
+    connect: async (binding, sessionId) =>
+      (await puppeteer.connect(
+        binding as never,
+        sessionId,
+      )) as unknown as ReusableBrowser,
+  };
 }

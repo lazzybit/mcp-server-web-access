@@ -20,7 +20,7 @@ import type {
 } from "./types";
 import { PageFailure, makePageError } from "./types";
 import { renderPage } from "./browser";
-import type { BrowserLauncher } from "./browser";
+import type { CapabilityLauncher } from "../browser/launcher";
 
 export const FETCH_PAGE_TOOL_NAME = "fetch_page";
 
@@ -36,7 +36,7 @@ export interface PageDeps {
   fetch: typeof fetch;
   getApiKey: () => Promise<string>;
   /** Test/override hook; the Worker injects a shared-session launcher. */
-  launchBrowser?: BrowserLauncher;
+  launchBrowser?: CapabilityLauncher;
   mcpDomain?: string;
   pageRouter?: string;
   browserEnabled?: string;

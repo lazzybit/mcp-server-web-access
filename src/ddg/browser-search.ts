@@ -1,10 +1,10 @@
 /**
  * Browser search transport used by the `ddg-browser` search provider.
  *
- * The provider layer stays free of `cloudflare:workers`; this adapter owns the
- * Browser Run binding. It launches at most one browser per search, bounds every
- * potentially hanging operation with its own timeout, and never touches the
- * coordinator's provider-selection state.
+ * The provider layer stays free of `cloudflare:workers`; this adapter consumes
+ * the shared browser capability. It opens at most one incognito context per
+ * search, bounds every potentially hanging operation with its own timeout, and
+ * never touches the coordinator's provider-selection state.
  *
  * Like `fetch_page`'s renderer, there is no whole-call deadline: termination
  * comes from bounded counts plus per-operation timeouts. The in-page
@@ -28,6 +28,8 @@ import {
 } from "../page/constants";
 import { TimeoutError, operationWindow, sleep, withTimeout } from "../page/timeout";
 import type { OperationWindow } from "../page/timeout";
+import { serializeExpression } from "../browser/launcher";
+import type { BrowserCapability, CapabilityLauncher, PageCapability } from "../browser/launcher";
 import { normalizeResultUrl } from "./parse";
 import { interruptedOrFailed, makeError } from "../types";
 import type { ErrorCode, Freshness, SearchParams, SearchResult, SearchResultItem } from "../types";
@@ -135,29 +137,12 @@ export function clickMoreResults(doc: SearchDomDocument = document): boolean {
   return false;
 }
 
-/** Minimal page surface used by the fallback. */
-export interface SearchPageLike {
-  goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
-  evaluate<T>(fn: () => T): Promise<T>;
-  setUserAgent?(value: string): Promise<void>;
-  setViewport?(viewport: { readonly width: number; readonly height: number }): Promise<void>;
-  setExtraHTTPHeaders?(headers: Record<string, string>): Promise<void>;
-}
-
-/** Minimal browser surface used by the fallback. */
-export interface SearchBrowserLike {
-  newPage(): Promise<SearchPageLike>;
-  close(): Promise<void>;
-}
-
-export type SearchBrowserLauncher = (binding: unknown) => Promise<SearchBrowserLike>;
-
 /** Injectable adapter dependencies (tests override the launcher). */
 export interface BrowserSearchDeps {
   /** The `BROWSER` binding. */
   binding?: unknown;
-  /** Test/override hook; defaults to `@cloudflare/puppeteer`. */
-  launch?: SearchBrowserLauncher;
+  /** The shared browser capability launcher injected by the provider. */
+  launch?: CapabilityLauncher;
   launchTimeoutMs?: number;
   callTimeoutMs?: number;
   navTimeoutMs?: number;
@@ -206,7 +191,15 @@ export async function searchViaBrowser(
   params: SearchParams,
   deps: BrowserSearchDeps = {},
 ): Promise<BrowserSearchOutcome> {
-  const launch = await resolveLauncher(deps.launch);
+  const launch = deps.launch;
+  if (launch === undefined) {
+    // The provider is only enabled with a launcher; a missing one is a wiring
+    // bug, not a browser attempt.
+    return {
+      attempted: false,
+      result: failedBrowserResult("UPSTREAM_ERROR", "browser launcher is not configured"),
+    };
+  }
   const launchTimeoutMs = deps.launchTimeoutMs ?? BROWSER_LAUNCH_TIMEOUT_MS;
   const callTimeoutMs = deps.callTimeoutMs ?? BROWSER_CALL_TIMEOUT_MS;
   const closeTimeoutMs = deps.closeTimeoutMs ?? BROWSER_CLOSE_TIMEOUT_MS;
@@ -219,7 +212,7 @@ export async function searchViaBrowser(
   };
 
   const launchPromise = launch(deps.binding);
-  let browser: SearchBrowserLike;
+  let browser: BrowserCapability;
   try {
     browser = await withTimeout(launchPromise, launchTimeoutMs, "browser launch timed out");
   } catch {
@@ -243,7 +236,7 @@ export async function searchViaBrowser(
 }
 
 async function runBrowserSearch(
-  browser: SearchBrowserLike,
+  browser: BrowserCapability,
   params: SearchParams,
   options: BrowserRunOptions,
 ): Promise<SearchResult> {
@@ -292,11 +285,11 @@ async function runBrowserSearch(
     const before = current.results.length;
     let clicked: boolean;
     try {
-      clicked = await withTimeout(
-        page.evaluate(clickMoreResults),
+      clicked = (await withTimeout(
+        page.evaluate(serializeExpression(clickMoreResults)),
         options.callTimeoutMs,
         "browser click timed out",
-      );
+      )) as boolean;
     } catch {
       return interruptedOrFailed(
         results,
@@ -345,7 +338,7 @@ async function runBrowserSearch(
   return { status: "exhausted", results };
 }
 
-async function configurePage(page: SearchPageLike, options: BrowserRunOptions): Promise<void> {
+async function configurePage(page: PageCapability, options: BrowserRunOptions): Promise<void> {
   if (typeof page.setUserAgent === "function") {
     await withTimeout(
       page.setUserAgent(BROWSER_SEARCH_USER_AGENT),
@@ -370,7 +363,7 @@ async function configurePage(page: SearchPageLike, options: BrowserRunOptions): 
 }
 
 async function navigate(
-  page: SearchPageLike,
+  page: PageCapability,
   params: SearchParams,
   options: BrowserRunOptions,
 ): Promise<void> {
@@ -397,7 +390,7 @@ interface ExtractionWait {
  * restarted per poll: the whole load shares `resultsTimeoutMs`.
  */
 async function waitForExtraction(
-  page: SearchPageLike,
+  page: PageCapability,
   options: BrowserRunOptions,
   accept: (extraction: SearchDomExtraction) => boolean,
 ): Promise<ExtractionWait> {
@@ -421,7 +414,7 @@ async function waitForExtraction(
 }
 
 function evaluateExtraction(
-  page: SearchPageLike,
+  page: PageCapability,
   options: BrowserRunOptions,
   window: OperationWindow,
 ): Promise<SearchDomExtraction> {
@@ -429,7 +422,11 @@ function evaluateExtraction(
   if (budget <= 0) {
     return Promise.reject(new TimeoutError("browser extraction timed out"));
   }
-  return withTimeout(page.evaluate(extractSearchDom), budget, "browser extraction timed out");
+  return withTimeout(
+    page.evaluate(serializeExpression(extractSearchDom)),
+    budget,
+    "browser extraction timed out",
+  ) as Promise<SearchDomExtraction>;
 }
 
 function appendResults(
@@ -456,14 +453,6 @@ function appendResults(
   return added;
 }
 
-async function resolveLauncher(provided?: SearchBrowserLauncher): Promise<SearchBrowserLauncher> {
-  if (provided !== undefined) return provided;
-  const module = await import("@cloudflare/puppeteer");
-  const launch = module.default.launch;
-  return (binding: unknown) =>
-    launch(binding as never) as unknown as Promise<SearchBrowserLike>;
-}
-
 function failedBrowserResult(code: ErrorCode, message: string): SearchResult {
   return { status: "failed", results: [], error: makeError(code, message) };
 }
@@ -476,7 +465,7 @@ function browserErrorResult(error: unknown): SearchResult {
 }
 
 /** Closes a session under a bound; a slow or hanging close never blocks. */
-async function closeBounded(browser: SearchBrowserLike, ms: number): Promise<void> {
+async function closeBounded(browser: BrowserCapability, ms: number): Promise<void> {
   try {
     await withTimeout(browser.close(), ms, "browser close timed out");
   } catch {

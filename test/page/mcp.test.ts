@@ -57,11 +57,12 @@ const RENDERED_BROWSER = {
       async content() {
         return article;
       },
-      url() {
+      async url() {
         return "https://example.com/app";
       },
-      async setRequestInterception() {},
-      on() {},
+      async evaluate(): Promise<unknown> {
+        return undefined;
+      },
     };
   },
   async close() {},

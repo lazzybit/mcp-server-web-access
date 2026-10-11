@@ -8,12 +8,13 @@ import { DDG_HTML_STATE_KEY } from "../../src/search/ddg-html-provider";
 import type { ProviderOutcome } from "../../src/search/provider";
 import type { StoragePort } from "../../src/search/deps";
 import { clickMoreResults, extractSearchDom } from "../../src/ddg/browser-search";
+import type { SearchDomExtraction } from "../../src/ddg/browser-search";
+import { serializeExpression } from "../../src/browser/launcher";
 import type {
-  SearchBrowserLauncher,
-  SearchBrowserLike,
-  SearchDomExtraction,
-  SearchPageLike,
-} from "../../src/ddg/browser-search";
+  BrowserCapability,
+  CapabilityLauncher,
+  PageCapability,
+} from "../../src/browser/launcher";
 import type { SearchResult } from "../../src/types";
 import { ManualClock, flushMicrotasks } from "./manual-clock";
 
@@ -56,28 +57,35 @@ function results(
   };
 }
 
-class FakeSearchPage implements SearchPageLike {
+class FakeSearchPage implements PageCapability {
   #batches: SearchDomExtraction[];
 
   constructor(batches: SearchDomExtraction[]) {
     this.#batches = batches;
   }
 
-  async goto(): Promise<unknown> {
+  async goto(): Promise<void> {
     return undefined;
   }
 
-  async evaluate<T>(fn: () => T): Promise<T> {
-    if ((fn as unknown) === extractSearchDom) {
-      const batch = this.#batches[0] ?? { kind: "unparseable" };
-      return batch as unknown as T;
+  async content(): Promise<string> {
+    return "";
+  }
+
+  async url(): Promise<string> {
+    return "about:blank";
+  }
+
+  async evaluate(expression: string): Promise<unknown> {
+    if (expression === serializeExpression(extractSearchDom)) {
+      return this.#batches[0] ?? { kind: "unparseable" };
     }
-    if ((fn as unknown) === clickMoreResults) return false as unknown as T;
+    if (expression === serializeExpression(clickMoreResults)) return false;
     throw new Error("unexpected evaluate");
   }
 }
 
-function browserFor(batch: SearchDomExtraction): SearchBrowserLike {
+function browserFor(batch: SearchDomExtraction): BrowserCapability {
   const page = new FakeSearchPage([batch]);
   return {
     newPage: async () => page,
@@ -236,7 +244,7 @@ describe("DdgBrowserSearchProvider", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const launch: SearchBrowserLauncher = async () => {
+    const launch: CapabilityLauncher = async () => {
       launches += 1;
       if (launches === 1) await gate;
       return browserFor(results([{ href: "https://a.example/" }], false));

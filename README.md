@@ -25,8 +25,8 @@ MCP client ──Bearer──▶ Cloudflare Access (Managed OAuth)
               └──────────────┬─────────────────────────────┘
                              ▼
               BrowserService Durable Object (singleton "global")
-              one reusable Browser Run session id; one incognito
-              context per operation, 60 s idle keep_alive
+              one retained Browser Run connection; one incognito
+              context per operation, 10 s idle keep_alive
 ```
 
 The Worker authenticates, serves MCP and validates input/output.
@@ -64,9 +64,9 @@ a bare domain: the issuer is `https://<TEAM_DOMAIN>` and the JWKS URL is
 | Binding | Type | Purpose |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | Secrets Store secret | OpenRouter API key (secret name `openrouter_api_key`, scope `workers`). Read via `await env.OPENROUTER_API_KEY.get()` and used only as the `Authorization: Bearer` header for the decisions request. |
-| `BROWSER` | Browser Run | Headless Chromium for the optional `fetch_page` render and the `search_topic` browser provider. Accessed only through the `BrowserService` session broker. |
+| `BROWSER` | Browser Run | Headless Chromium for the optional `fetch_page` render and the `search_topic` browser provider. Reached only through the `BrowserService` capability launcher; never launched directly. |
 | `SEARCH_SERVICE` | Durable Object | The search service (singleton `global`). |
-| `BROWSER_SERVICE` | Durable Object | The Browser Run session broker (singleton `global`). Owns one reusable `sessionId`; never holds a browser object. |
+| `BROWSER_SERVICE` | Durable Object | The browser capability Durable Object (singleton `global`). Owns one retained Browser Run connection in memory; never persists a session id. |
 | `SEARCH_VNC` | VPC Network (optional) | DuckDuckGo egress only. `fetch_page` never uses it. |
 
 The OpenRouter key is never logged, measured, hashed, or echoed; decision
@@ -134,24 +134,32 @@ search connects to the shared session below in its own incognito context.
 #### Shared Browser Run session
 
 Both browser call sites go through one `BrowserService` Durable Object
-(`global`), which brokers a single Browser Run session id:
+(`global`), which owns a single retained Browser Run connection:
 
-- The broker acquires a session with `keep_alive: 60_000` only when none is
-  stored or when the stored id is confirmed absent by `puppeteer.sessions()`. A
-  failing `sessions()` call keeps the stored id: a duplicate session is worse
-  than a possibly stale one.
-- Callers `puppeteer.connect()` themselves and run the whole operation in a
-  private `createBrowserContext()`. Cleanup closes only that context and the
-  operation's own CDP connection, so cookies and storage never leak and the
-  shared session is never closed for other callers.
-- Concurrent callers may share the session, each with its own context; browser
-  operations are no longer serialized globally, while the `ddg-browser`
-  provider keeps its own FIFO. A failed connect refreshes the session at most
-  once, and only when the broker returns a different id; navigation and
-  pagination are never replayed.
-- The id lives in Durable Object storage, so eviction is harmless and the next
-  call reconnects. `keep_alive` closes the session after 60 s of inactivity;
-  there is no alarm, heartbeat or explicit shutdown.
+- The connection is acquired in memory with `keep_alive: 10_000` on first use
+  and reused by every subsequent operation. Nothing is persisted: after Durable
+  Object eviction or `keep_alive` expiry the next operation acquires a new
+  session. `puppeteer.sessions()` is no longer consulted.
+- `BrowserService` exposes one generic capability: `openContext()` acquires or
+  reuses the connection and returns an operation-scoped `RpcTarget`
+  (`ContextTarget`/`PageTarget`) in which `goto`, `content`, `url`, `evaluate`
+  and setup run inside the Durable Object. Puppeteer objects never cross the
+  RPC boundary; `goto` returns plain data, `url()` is asynchronous and
+  `evaluate` takes a serialized expression string.
+- Each operation runs in its own incognito context created through that
+  capability. Cleanup closes only that context, so cookies and storage never
+  leak and the shared connection is never closed for other callers. Concurrent
+  operations share the connection, each with its own context; the
+  `ddg-browser` provider still keeps its own FIFO.
+- A cached connection that reports `connected === false` is invalidated by
+  identity and replaced once. A failed context creation is retried at most
+  once, and only when the connection is established to be lost; navigation and
+  pagination are never replayed. `keep_alive` closes the session after 10 s of
+  inactivity; there is no alarm, heartbeat or explicit shutdown.
+- `fetch_page` still owns its URL policy: the page capability calls back into
+  the Worker for every navigation request, and the pure `decideNavigation` rule
+  stays in `src/page/browser.ts`. The policy stub is retained with `dup()` and
+  disposed when the context closes.
 
 Only when no provider is ready does the coordinator wait: it waits for the
 soonest recovering provider when the remainder is at most 10 s (`10_000` waits,
@@ -232,11 +240,12 @@ redirect counts.
 | `search_topic` browser provider context close / disconnect (giving up is acceptable) | 5 s |
 | Probe redirect hop (headers + body) | 15 s |
 | Decisions call (secret fetch + request + body) | 8 s |
-| Browser session acquisition (broker) | 20 s |
+| Browser session acquisition (shared connection) | 20 s |
 | Browser connect / context creation | 20 s each |
 | Browser navigation | 20 s |
 | Browser setup / `content()` call | 20 s |
-| Browser context close / disconnect (giving up is acceptable) | 5 s |
+| Browser request-policy decision | 20 s |
+| Browser context close (giving up is acceptable) | 5 s |
 | Rendered settling wait (intentional, not a timeout) | 3 s |
 
 A per-operation timeout is not a new wire error: a stalled `search_topic`
@@ -276,7 +285,8 @@ removing many smaller non-content nodes has no such limit.
 #### Request security and residual risk
 
 - Every probe redirect is re-validated. Browser navigation requests (and their
-  redirect chains) are validated when request interception is available.
+  redirect chains) are validated through the page capability's request policy
+  on every navigation, including after the initial `goto` returns.
 - Workers `fetch` resolves DNS inside the platform, so hostname checks cannot
   defend against DNS rebinding; browser subrequests (scripts, frames, XHR) are
   outside this boundary. This is a documented limitation, not a claimed

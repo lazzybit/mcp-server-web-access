@@ -1,6 +1,6 @@
 import { AuthenticationError, authenticate } from "./access";
 import { BROWSER_OBJECT_NAME, BrowserService } from "./browser/service";
-import { createSessionLauncher } from "./browser/session";
+import { createCapabilityLauncher } from "./browser/launcher";
 import { createWebSearchHandler } from "./mcp";
 import { SearchService, SEARCH_OBJECT_NAME } from "./search-service";
 import type { SearchParams, SearchResult } from "./types";
@@ -35,9 +35,9 @@ export default {
           getApiKey: () => env.OPENROUTER_API_KEY.get(),
           ...(env.BROWSER !== undefined
             ? {
-                launchBrowser: createSessionLauncher({
-                  broker: env.BROWSER_SERVICE.getByName(BROWSER_OBJECT_NAME),
-                  binding: env.BROWSER,
+                launchBrowser: createCapabilityLauncher({
+                  openContext: () =>
+                    env.BROWSER_SERVICE.getByName(BROWSER_OBJECT_NAME).openContext(),
                 }),
               }
             : {}),
