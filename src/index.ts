@@ -1,9 +1,11 @@
 import { AuthenticationError, authenticate } from "./access";
+import { BROWSER_OBJECT_NAME, BrowserService } from "./browser/service";
+import { createSessionLauncher } from "./browser/session";
 import { createWebSearchHandler } from "./mcp";
 import { SearchService, SEARCH_OBJECT_NAME } from "./search-service";
 import type { SearchParams, SearchResult } from "./types";
 
-export { SearchService };
+export { BrowserService, SearchService };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -31,7 +33,14 @@ export default {
           // Public egress only: the search VPC binding is deliberately not used.
           fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
           getApiKey: () => env.OPENROUTER_API_KEY.get(),
-          ...(env.BROWSER !== undefined ? { browser: env.BROWSER } : {}),
+          ...(env.BROWSER !== undefined
+            ? {
+                launchBrowser: createSessionLauncher({
+                  broker: env.BROWSER_SERVICE.getByName(BROWSER_OBJECT_NAME),
+                  binding: env.BROWSER,
+                }),
+              }
+            : {}),
           mcpDomain: env.MCP_DOMAIN,
           pageRouter: env.PAGE_ROUTER,
           browserEnabled: env.BROWSER_ENABLED,

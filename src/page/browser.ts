@@ -47,8 +47,8 @@ export interface BrowserLike {
 export type BrowserLauncher = (binding: unknown) => Promise<BrowserLike>;
 
 export interface RenderOptions {
-  /** The `BROWSER` binding. */
-  binding: unknown;
+  /** The `BROWSER` binding, forwarded to the launcher. */
+  binding?: unknown;
   /** The statically resolved final URL to navigate to. */
   url: string;
   launch?: BrowserLauncher;

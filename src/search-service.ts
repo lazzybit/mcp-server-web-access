@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { BROWSER_OBJECT_NAME } from "./browser/service";
 import type { BrowserSearchDeps } from "./ddg/browser-search";
 import type { AppEnv } from "./env";
 import { SearchCoordinator, defaultCoordinatorDeps } from "./search/coordinator";
@@ -51,7 +52,11 @@ export class SearchService extends DurableObject<Env> {
     this.#html = new DdgHtmlSearchProvider(storage, htmlDeps);
     this.#browser = new DdgBrowserSearchProvider(
       storage,
-      defaultBrowserDeps(config, shared),
+      defaultBrowserDeps(
+        config,
+        this.env.BROWSER_SERVICE.getByName(BROWSER_OBJECT_NAME),
+        shared,
+      ),
     );
     this.#coordinator = new SearchCoordinator(
       [this.#html, this.#browser],

@@ -19,11 +19,15 @@
   ],
 
   "durable_objects": {
-    "bindings": [{ "name": "SEARCH_SERVICE", "class_name": "SearchService" }]
+    "bindings": [
+      { "name": "SEARCH_SERVICE", "class_name": "SearchService" },
+      { "name": "BROWSER_SERVICE", "class_name": "BrowserService" }
+    ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["DdgService"] },
-    { "tag": "v2", "renamed_classes": [{ "from": "DdgService", "to": "SearchService" }] }
+    { "tag": "v2", "renamed_classes": [{ "from": "DdgService", "to": "SearchService" }] },
+    { "tag": "v3", "new_sqlite_classes": ["BrowserService"] }
   ],
 
   // Browser Run binding for the optional single render in `fetch_page`.

@@ -35,9 +35,7 @@ export interface PageDeps {
   /** Public egress only; never the search VPC binding. */
   fetch: typeof fetch;
   getApiKey: () => Promise<string>;
-  /** The `BROWSER` binding, when configured. */
-  browser?: unknown;
-  /** Test/override hook; defaults to `@cloudflare/puppeteer`. */
+  /** Test/override hook; the Worker injects a shared-session launcher. */
   launchBrowser?: BrowserLauncher;
   mcpDomain?: string;
   pageRouter?: string;
@@ -176,13 +174,16 @@ async function executeFetchPage(
       fetch: deps.fetch,
       getApiKey: deps.getApiKey,
     });
-    if (needsRender(decision, RENDER_THRESHOLD) && browserEnabled && deps.browser !== undefined) {
+    if (
+      needsRender(decision, RENDER_THRESHOLD) &&
+      browserEnabled &&
+      deps.launchBrowser !== undefined
+    ) {
       const renderStart = Date.now();
       try {
         const outcome = await renderPage({
-          binding: deps.browser,
           url: snapshot.finalUrl,
-          ...(deps.launchBrowser !== undefined ? { launch: deps.launchBrowser } : {}),
+          launch: deps.launchBrowser,
         });
         html = outcome.html;
         baseUrl = outcome.finalUrl;

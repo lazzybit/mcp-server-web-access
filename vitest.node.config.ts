@@ -13,6 +13,7 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: [
+      "test/browser/session.test.ts",
       "test/ddg/request.test.ts",
       "test/ddg/browser-search.test.ts",
       "test/ddg/ddg-html-provider.test.ts",

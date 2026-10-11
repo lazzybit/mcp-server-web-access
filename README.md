@@ -21,6 +21,12 @@ MCP client ──Bearer──▶ Cloudflare Access (Managed OAuth)
               │                                 ├─ OpenRouter decisions (needs_render)
               ▼                                 ├─ Browser Run (one render, if needed)
    DuckDuckGo HTML endpoint                     └─ Readability → plain text
+              │                                            │
+              └──────────────┬─────────────────────────────┘
+                             ▼
+              BrowserService Durable Object (singleton "global")
+              one reusable Browser Run session id; one incognito
+              context per operation, 60 s idle keep_alive
 ```
 
 The Worker authenticates, serves MCP and validates input/output.
@@ -58,8 +64,9 @@ a bare domain: the issuer is `https://<TEAM_DOMAIN>` and the JWKS URL is
 | Binding | Type | Purpose |
 | --- | --- | --- |
 | `OPENROUTER_API_KEY` | Secrets Store secret | OpenRouter API key (secret name `openrouter_api_key`, scope `workers`). Read via `await env.OPENROUTER_API_KEY.get()` and used only as the `Authorization: Bearer` header for the decisions request. |
-| `BROWSER` | Browser Run | Headless Chromium session for the optional `fetch_page` render and the `search_topic` browser provider. |
+| `BROWSER` | Browser Run | Headless Chromium for the optional `fetch_page` render and the `search_topic` browser provider. Accessed only through the `BrowserService` session broker. |
 | `SEARCH_SERVICE` | Durable Object | The search service (singleton `global`). |
+| `BROWSER_SERVICE` | Durable Object | The Browser Run session broker (singleton `global`). Owns one reusable `sessionId`; never holds a browser object. |
 | `SEARCH_VNC` | VPC Network (optional) | DuckDuckGo egress only. `fetch_page` never uses it. |
 
 The OpenRouter key is never logged, measured, hashed, or echoed; decision
@@ -121,7 +128,30 @@ a 1.5 s cooldown. Both hand the partial results to the coordinator and switch
 providers; there is no same-provider retry.
 - `ddg-browser` (`search/providers/v2/ddg-browser/state`): the same cooldown
 split (30 minutes for a challenge, 1.5 s otherwise), no dispatch pacing and no
-quota system. Searches are serialized so one browser session runs at a time.
+quota system. Searches are serialized so one browser search runs at a time; each
+search connects to the shared session below in its own incognito context.
+
+#### Shared Browser Run session
+
+Both browser call sites go through one `BrowserService` Durable Object
+(`global`), which brokers a single Browser Run session id:
+
+- The broker acquires a session with `keep_alive: 60_000` only when none is
+  stored or when the stored id is confirmed absent by `puppeteer.sessions()`. A
+  failing `sessions()` call keeps the stored id: a duplicate session is worse
+  than a possibly stale one.
+- Callers `puppeteer.connect()` themselves and run the whole operation in a
+  private `createBrowserContext()`. Cleanup closes only that context and the
+  operation's own CDP connection, so cookies and storage never leak and the
+  shared session is never closed for other callers.
+- Concurrent callers may share the session, each with its own context; browser
+  operations are no longer serialized globally, while the `ddg-browser`
+  provider keeps its own FIFO. A failed connect refreshes the session at most
+  once, and only when the broker returns a different id; navigation and
+  pagination are never replayed.
+- The id lives in Durable Object storage, so eviction is harmless and the next
+  call reconnects. `keep_alive` closes the session after 60 s of inactivity;
+  there is no alarm, heartbeat or explicit shutdown.
 
 Only when no provider is ready does the coordinator wait: it waits for the
 soonest recovering provider when the remainder is at most 10 s (`10_000` waits,
@@ -190,17 +220,19 @@ redirect counts.
 | Operation | Bound |
 | --- | --- |
 | `search_topic` upstream attempt (headers + body) | 10 s |
-| `search_topic` browser provider launch | 20 s |
+| `search_topic` browser provider session acquisition | 20 s |
+| `search_topic` browser provider connect / context creation | 20 s each |
 | `search_topic` browser provider navigation | 20 s |
 | `search_topic` browser provider setup / extraction / click | 20 s each |
 | `search_topic` browser provider result wait (shared across polls) | 15 s per load |
-| `search_topic` browser provider close (giving up is acceptable) | 5 s |
+| `search_topic` browser provider context close / disconnect (giving up is acceptable) | 5 s |
 | Probe redirect hop (headers + body) | 15 s |
 | Decisions call (secret fetch + request + body) | 8 s |
-| Browser launch | 20 s |
+| Browser session acquisition (broker) | 20 s |
+| Browser connect / context creation | 20 s each |
 | Browser navigation | 20 s |
 | Browser setup / `content()` call | 20 s |
-| Browser close (giving up is acceptable) | 5 s |
+| Browser context close / disconnect (giving up is acceptable) | 5 s |
 | Rendered settling wait (intentional, not a timeout) | 3 s |
 
 A per-operation timeout is not a new wire error: a stalled `search_topic`
@@ -218,15 +250,17 @@ it is bounded by the 2 MiB body cap.
 - The browser provider depends on an emulated desktop-browser fingerprint;
   DuckDuckGo may change its detection at any time, so challenge detection is
   mandatory and a challenge opens the provider's 30-minute cooldown.
-- Browser Run can fail with `429` on launch; such a failure opens the browser
-  provider's 1.5 s transient cooldown and the coordinator may still return
-  `NO_SEARCH_PROVIDER_AVAILABLE` when no provider recovers.
-- The worst case for one browser search is finite: launch 20 s + `newPage` 20 s +
-  setup 20 s + navigation 20 s + results 15 s + extraction 20 s + up to four
-  loads of (click 20 s + wait 15 s) + close 5 s.
+- Browser Run can fail with `429` on session acquisition; such a failure opens
+  the browser provider's 1.5 s transient cooldown and the coordinator may still
+  return `NO_SEARCH_PROVIDER_AVAILABLE` when no provider recovers.
+- The worst case for one browser search is finite: session acquisition 20 s +
+  connect 20 s + context 20 s + `newPage` 20 s + setup 20 s + navigation 20 s +
+  results 15 s + extraction 20 s + up to four loads of (click 20 s + wait 15 s) +
+  close 5 s.
 - `withTimeout` does not cancel remote work, and synchronous parsing is not
-  interruptible; a launch that resolves after its timeout is closed under a
-  bound, but a leaked remote session cannot be strictly guaranteed against.
+  interruptible; a session acquisition, connect or context creation that
+  resolves after its timeout is disconnected/closed under a bound, but a leaked
+  remote session cannot be strictly guaranteed against.
 
 #### Request security and residual risk
 

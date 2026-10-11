@@ -24,6 +24,8 @@ export const BROWSER_LAUNCH_TIMEOUT_MS = 20_000;
 export const BROWSER_CALL_TIMEOUT_MS = 20_000;
 /** Upper bound for closing a browser session; giving up is acceptable. */
 export const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+/** Idle window before Browser Run closes the shared session on its own. */
+export const BROWSER_KEEP_ALIVE_MS = 60_000;
 /** Settling wait after the browser reaches `domcontentloaded`; intentional, not a timeout. */
 export const RENDERED_WAIT_MS = 3_000;
 

@@ -2,13 +2,16 @@
  * Browser transport as a {@link SearchProvider}.
  *
  * Wraps {@link searchViaBrowser}, which already bounds every operation and
- * always closes the session. The provider adds its own independent cooldown
- * under `search/providers/v2/ddg-browser/state` and serializes searches so only
- * one browser session runs at a time.
+ * always closes its own incognito context and CDP connection. The provider adds
+ * its own independent cooldown under `search/providers/v2/ddg-browser/state`
+ * and serializes searches so only one browser search runs at a time. The shared
+ * Browser Run session itself is brokered by `BrowserService`.
  */
 import { COOLDOWN_MS, TRANSIENT_DELAY_MS } from "../constants";
 import { searchViaBrowser } from "../ddg/browser-search";
 import type { BrowserSearchDeps } from "../ddg/browser-search";
+import { createSessionLauncher } from "../browser/session";
+import type { BrowserSessionBroker } from "../browser/session";
 import { makeError } from "../types";
 import type { AppEnv } from "../env";
 import type { SearchError, SearchParams, SearchResult, SearchResultItem } from "../types";
@@ -37,11 +40,17 @@ interface BrowserPersistedState {
 
 export function defaultBrowserDeps(
   env: AppEnv,
+  broker?: BrowserSessionBroker,
   clock: Clock = new RealClock(),
 ): DdgBrowserDeps {
+  const browser: BrowserSearchDeps = env.BROWSER !== undefined ? { binding: env.BROWSER } : {};
+  if (env.BROWSER !== undefined && broker !== undefined) {
+    // One shared Browser Run session, one incognito context per search.
+    browser.launch = createSessionLauncher({ broker, binding: env.BROWSER });
+  }
   return {
     clock,
-    browser: env.BROWSER !== undefined ? { binding: env.BROWSER } : {},
+    browser,
     enabled: (env.BROWSER_ENABLED ?? "true") !== "false" && env.BROWSER !== undefined,
     cooldownMs: COOLDOWN_MS,
     transientDelayMs: TRANSIENT_DELAY_MS,

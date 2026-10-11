@@ -115,7 +115,6 @@ describe("runFetchPage", () => {
 
   it("renders an app shell once when the model asks for it", async () => {
     const { deps } = harness(() => htmlResponse(spaShell), () => noulResponse(0.9), {
-      browser: {},
       launchBrowser: async () => RENDERED_BROWSER,
     });
     const output = await runFetchPage(deps, { url: "https://example.com/app" });
@@ -138,7 +137,6 @@ describe("runFetchPage", () => {
 
   it("falls back to static HTML when rendering fails", async () => {
     const { deps } = harness(() => htmlResponse(article), () => noulResponse(0.9), {
-      browser: {},
       launchBrowser: async () => {
         throw new Error("render failed");
       },
@@ -154,7 +152,6 @@ describe("runFetchPage", () => {
       () => htmlResponse(spaShell),
       () => noulResponse(0.9),
       {
-        browser: {},
         launchBrowser: async () => {
           throw new Error("render failed");
         },
