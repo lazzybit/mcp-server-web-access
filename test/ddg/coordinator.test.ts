@@ -28,17 +28,6 @@ function exhausted(results: string[] = []): ProviderOutcome {
   return { kind: "done", result: { status: "exhausted", results: items(results) } };
 }
 
-function pageLimit(results: string[]): ProviderOutcome {
-  return {
-    kind: "done",
-    result: {
-      status: "interrupted",
-      results: items(results),
-      error: makeError("PAGE_LIMIT", "page limit"),
-    },
-  };
-}
-
 function fallback(code: "PROVIDER_CHALLENGE" | "UPSTREAM_ERROR", results: string[] = []): ProviderOutcome {
   return {
     kind: "fallback",
@@ -124,7 +113,7 @@ function coordinatorFor(clock: ManualClock, providers: SearchProvider[]): Search
   return new SearchCoordinator(providers, deps);
 }
 
-const REQUEST: SearchParams = { query: "x", maxResults: 5, region: "wt-wt" };
+const REQUEST: SearchParams = { query: "x", effort: "low", region: "wt-wt" };
 
 describe("SearchCoordinator", () => {
   it("falls back to the next provider within the same search", async () => {
@@ -133,7 +122,7 @@ describe("SearchCoordinator", () => {
     const browser = new FakeProvider("ddg-browser", clock, [ok(["https://b.example/"])]);
     const coordinator = coordinatorFor(clock, [html, browser]);
 
-    const result = await drive(clock, coordinator.search({ ...REQUEST, maxResults: 1 }));
+    const result = await drive(clock, coordinator.search({ ...REQUEST }));
 
     expect(result.status).toBe("ok");
     expect(result.results.map((item) => item.url)).toEqual(["https://b.example/"]);
@@ -229,7 +218,7 @@ describe("SearchCoordinator", () => {
     const third = new FakeProvider("c", clock, [ok(["https://c.example/"])]);
     const coordinator = coordinatorFor(clock, [first, second, third]);
 
-    const result = await drive(clock, coordinator.search({ ...REQUEST, maxResults: 1 }));
+    const result = await drive(clock, coordinator.search({ ...REQUEST }));
 
     expect(result.status).toBe("ok");
     expect(result.results.map((item) => item.url)).toEqual(["https://c.example/"]);
@@ -242,7 +231,7 @@ describe("SearchCoordinator", () => {
     const second = new FakeProvider("b", clock, [ok(["https://b.example/"])]);
     const coordinator = coordinatorFor(clock, [first, second]);
 
-    const okResult = await drive(clock, coordinator.search({ ...REQUEST, maxResults: 1 }));
+    const okResult = await drive(clock, coordinator.search({ ...REQUEST }));
     expect(okResult.status).toBe("ok");
     expect(second.calls).toBe(0);
 
@@ -255,19 +244,62 @@ describe("SearchCoordinator", () => {
     expect(emptySecond.calls).toBe(0);
   });
 
-  it("does not fall back on a page limit", async () => {
+  it("keeps a provider ok with one result as ok", async () => {
     const clock = new ManualClock();
-    const first = new FakeProvider("a", clock, [pageLimit(["https://a.example/"])]);
-    const second = new FakeProvider("b", clock, [ok(["https://b.example/"])]);
+    const provider = new FakeProvider("a", clock, [ok(["https://a.example/"])]);
+    const coordinator = coordinatorFor(clock, [provider]);
+
+    const result = await drive(clock, coordinator.search({ ...REQUEST }));
+
+    expect(result.status).toBe("ok");
+    expect(result.results.map((item) => item.url)).toEqual(["https://a.example/"]);
+  });
+
+  it("keeps a provider exhausted with many results as exhausted", async () => {
+    const clock = new ManualClock();
+    const provider = new FakeProvider("a", clock, [
+      exhausted(["https://a.example/", "https://b.example/", "https://c.example/"]),
+    ]);
+    const coordinator = coordinatorFor(clock, [provider]);
+
+    const result = await drive(clock, coordinator.search({ ...REQUEST }));
+
+    expect(result.status).toBe("exhausted");
+    expect(result.results).toHaveLength(3);
+  });
+
+  it("does not truncate more than 50 merged results", async () => {
+    const clock = new ManualClock();
+    const urls = Array.from({ length: 60 }, (_, index) => `https://example.com/${index}`);
+    const provider = new FakeProvider("a", clock, [ok(urls)]);
+    const coordinator = coordinatorFor(clock, [provider]);
+
+    const result = await drive(clock, coordinator.search({ ...REQUEST }));
+
+    expect(result.status).toBe("ok");
+    expect(result.results).toHaveLength(60);
+    expect(result.results.map((item) => item.rank)).toEqual(
+      Array.from({ length: 60 }, (_, index) => index + 1),
+    );
+  });
+
+  it("drops duplicate urls across providers", async () => {
+    const clock = new ManualClock();
+    const first = new FakeProvider("a", clock, [
+      fallback("UPSTREAM_ERROR", ["https://a.example/"]),
+    ]);
+    const second = new FakeProvider("b", clock, [
+      ok(["https://a.example/", "https://b.example/"]),
+    ]);
     const coordinator = coordinatorFor(clock, [first, second]);
 
     const result = await drive(clock, coordinator.search({ ...REQUEST }));
 
-    expect(result.status).toBe("interrupted");
-    expect(result.results.map((item) => item.url)).toEqual(["https://a.example/"]);
-    if (result.status !== "interrupted") return;
-    expect(result.error.code).toBe("PAGE_LIMIT");
-    expect(second.calls).toBe(0);
+    expect(result.status).toBe("ok");
+    expect(result.results.map((item) => item.url)).toEqual([
+      "https://a.example/",
+      "https://b.example/",
+    ]);
   });
 
   it("returns NO_SEARCH_PROVIDER_AVAILABLE with retained partial results", async () => {
@@ -337,8 +369,8 @@ describe("SearchCoordinator", () => {
     provider.gateNext();
     const coordinator = coordinatorFor(clock, [provider]);
 
-    const first = coordinator.search({ query: "first", maxResults: 1, region: "wt-wt" });
-    const second = coordinator.search({ query: "second", maxResults: 1, region: "wt-wt" });
+    const first = coordinator.search({ query: "first", effort: "low", region: "wt-wt" });
+    const second = coordinator.search({ query: "second", effort: "low", region: "wt-wt" });
 
     await flushMicrotasks();
     expect(provider.calls).toBe(1);

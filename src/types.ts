@@ -2,10 +2,17 @@
 
 export type Freshness = "day" | "week" | "month" | "year";
 
+/**
+ * Intended search intensity, not a result-count target. Each provider reads it
+ * as its own amount of search work; the DDG transports currently map it to
+ * 1/2/3 result pages or batches including the initial load.
+ */
+export type SearchEffort = "low" | "medium" | "high";
+
 /** Validated tool parameters forwarded to the Durable Object. */
 export interface SearchParams {
   query: string;
-  maxResults: number;
+  effort: SearchEffort;
   region: string;
   freshness?: Freshness;
 }
@@ -23,6 +30,8 @@ export interface SearchResultItem {
  * Error codes kept for wire compatibility. `TIMEOUT` and `ABORTED` are no
  * longer emitted by `search_topic`: per-operation timeouts surface as
  * `UPSTREAM_ERROR`, and there is no whole-call deadline or caller cancellation.
+ * `PAGE_LIMIT` is legacy: effort completion is a normal `ok`, so no path emits
+ * it any more.
  */
 export type ErrorCode =
   | "INVALID_INPUT"

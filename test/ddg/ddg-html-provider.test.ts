@@ -12,6 +12,7 @@ import type { FetchLike } from "../../src/ddg/request";
 import type { ParsedPage } from "../../src/ddg/parse";
 import type { AppEnv } from "../../src/env";
 import type { SearchResult } from "../../src/types";
+import type { SearchParams } from "../../src/types";
 import { ManualClock, drive, flushMicrotasks } from "./manual-clock";
 
 function doneOf(outcome: ProviderOutcome): SearchResult {
@@ -96,7 +97,6 @@ function deps(
     attemptTimeoutMs: 10_000,
     cooldownMs: 60_000,
     transientDelayMs: 1_500,
-    maxPages: 5,
     logLevel: "error",
     ...overrides,
   };
@@ -125,7 +125,7 @@ function providerFor(
   return { provider, storage };
 }
 
-const REQUEST = { query: "x", maxResults: 4, region: "wt-wt" };
+const REQUEST: SearchParams = { query: "x", effort: "medium", region: "wt-wt" };
 
 describe("defaultHtmlDeps", () => {
   it("always uses the compiled-in upstream endpoint and fixed interval", () => {
@@ -139,7 +139,7 @@ describe("defaultHtmlDeps", () => {
 });
 
 describe("DdgHtmlSearchProvider", () => {
-  it("paginates, deduplicates and reports ok at the requested count", async () => {
+  it("paginates, deduplicates and reports exhausted on the last page", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
     upstream.pages = {
@@ -150,7 +150,7 @@ describe("DdgHtmlSearchProvider", () => {
 
     const result = doneOf(await drive(clock, provider.search({ ...REQUEST })));
 
-    expect(result.status).toBe("ok");
+    expect(result.status).toBe("exhausted");
     expect(result.results.map((item) => item.url)).toEqual([
       "https://a.example/",
       "https://b.example/",
@@ -160,6 +160,26 @@ describe("DdgHtmlSearchProvider", () => {
     expect(result.results.map((item) => item.rank)).toEqual([1, 2, 3, 4]);
   });
 
+  it("reports ok when the effort limit is reached with a continuation", async () => {
+    const clock = new ManualClock();
+    const upstream = new Upstream(clock);
+    upstream.pages = {
+      "0": page(["https://a.example/", "https://b.example/"], "25"),
+    };
+    const { provider } = providerFor(clock, upstream);
+
+    const result = doneOf(
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
+    );
+
+    expect(result.status).toBe("ok");
+    expect(result.results.map((item) => item.url)).toEqual([
+      "https://a.example/",
+      "https://b.example/",
+    ]);
+    expect(upstream.calls.map((call) => call.s)).toEqual(["0"]);
+  });
+
   it("reports exhausted when the provider runs out of pages", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
@@ -167,7 +187,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream);
 
     const result = doneOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 10, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
     expect(result.status).toBe("exhausted");
     expect(result.results).toHaveLength(1);
@@ -182,7 +202,7 @@ describe("DdgHtmlSearchProvider", () => {
     };
     const { provider } = providerFor(clock, upstream);
 
-    await drive(clock, provider.search({ query: "x", maxResults: 50, region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "x", effort: "medium", region: "wt-wt" }));
 
     expect(upstream.calls.map((call) => call.s)).toEqual(["0", "25"]);
     expect(upstream.calls[1]!.at - upstream.calls[0]!.at).toBe(5_000);
@@ -194,8 +214,8 @@ describe("DdgHtmlSearchProvider", () => {
     upstream.pages = { "0": page(["https://a.example/"], null) };
     const { provider } = providerFor(clock, upstream);
 
-    await drive(clock, provider.search({ query: "a", maxResults: 1, region: "wt-wt" }));
-    await drive(clock, provider.search({ query: "b", maxResults: 1, region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "a", effort: "low", region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "b", effort: "low", region: "wt-wt" }));
 
     expect(upstream.calls).toHaveLength(2);
     expect(upstream.calls[1]!.at - upstream.calls[0]!.at).toBe(5_000);
@@ -211,7 +231,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider, storage } = providerFor(clock, upstream);
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 50, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "medium", region: "wt-wt" })),
     );
 
     expect(outcome.error.code).toBe("PROVIDER_CHALLENGE");
@@ -235,11 +255,11 @@ describe("DdgHtmlSearchProvider", () => {
     upstream.pages = { "0": { kind: "challenge" } };
     const { provider } = providerFor(clock, upstream);
 
-    await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" }));
     const callsAfterChallenge = upstream.calls.length;
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "y", maxResults: 1, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "y", effort: "low", region: "wt-wt" })),
     );
     expect(outcome.error.code).toBe("RATE_LIMITED");
     expect(outcome.error.retryAfterMs).toBe(60_000);
@@ -257,7 +277,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream);
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 50, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "medium", region: "wt-wt" })),
     );
 
     expect(outcome.error.code).toBe("UPSTREAM_ERROR");
@@ -275,7 +295,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream, { parse });
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 2, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
 
     expect(outcome.error.code).toBe("PARSE_FAILED");
@@ -290,7 +310,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream);
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
     expect(outcome.error.code).toBe("PARSE_FAILED");
     expect(provider.getNextRetryAt()).toBe(clock.now() + 1_500);
@@ -304,7 +324,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream);
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
     expect(outcome.error.code).toBe("PROVIDER_CHALLENGE");
     expect(provider.getNextRetryAt()).toBe(clock.now() + 60_000);
@@ -318,30 +338,29 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream);
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
     expect(outcome.error.code).toBe("PROVIDER_CHALLENGE");
   });
 
-  it("stops at the page limit as a complete interrupted result", async () => {
+  it("reports ok at the effort limit with a continuation", async () => {
     const clock = new ManualClock();
     const upstream = new Upstream(clock);
     upstream.pages = {
       "0": page(["https://a.example/"], "25"),
       "25": page(["https://b.example/"], "50"),
     };
-    const { provider } = providerFor(clock, upstream, { maxPages: 2 });
+    const { provider } = providerFor(clock, upstream);
 
     const result = doneOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 50, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "medium", region: "wt-wt" })),
     );
-    expect(result.status).toBe("interrupted");
+    expect(result.status).toBe("ok");
     expect(result.results.map((item) => item.url)).toEqual([
       "https://a.example/",
       "https://b.example/",
     ]);
-    if (result.status !== "interrupted") return;
-    expect(result.error.code).toBe("PAGE_LIMIT");
+    expect(upstream.calls.map((call) => call.s)).toEqual(["0", "25"]);
   });
 
   it("does not write storage on a successful search", async () => {
@@ -350,7 +369,7 @@ describe("DdgHtmlSearchProvider", () => {
     upstream.pages = { "0": page(["https://a.example/"], null) };
     const { provider, storage } = providerFor(clock, upstream);
 
-    await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" }));
     expect(storage.puts).toBe(0);
   });
 
@@ -365,7 +384,7 @@ describe("DdgHtmlSearchProvider", () => {
 
     expect(provider.getNextRetryAt()).toBe(clock.now() + 30_000);
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" })),
     );
     expect(outcome.error.code).toBe("RATE_LIMITED");
     expect(upstream.calls).toHaveLength(0);
@@ -388,7 +407,7 @@ describe("DdgHtmlSearchProvider", () => {
     upstream.pages = { "0": { kind: "challenge" } };
     const { provider, storage } = providerFor(clock, upstream);
 
-    await drive(clock, provider.search({ query: "x", maxResults: 1, region: "wt-wt" }));
+    await drive(clock, provider.search({ query: "x", effort: "low", region: "wt-wt" }));
     await flushMicrotasks(4);
 
     const restored = new DdgHtmlSearchProvider(storage, deps(clock, new Upstream(clock)));
@@ -404,7 +423,7 @@ describe("DdgHtmlSearchProvider", () => {
     const { provider } = providerFor(clock, upstream, { attemptTimeoutMs: 1_000 });
 
     const outcome = fallbackOf(
-      await drive(clock, provider.search({ query: "x", maxResults: 50, region: "wt-wt" })),
+      await drive(clock, provider.search({ query: "x", effort: "medium", region: "wt-wt" })),
     );
 
     expect(outcome.error.code).toBe("UPSTREAM_ERROR");

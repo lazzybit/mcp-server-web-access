@@ -7,18 +7,18 @@
  * never touches the coordinator's provider-selection state.
  *
  * Like `fetch_page`'s renderer, there is no whole-call deadline: termination
- * comes from bounded counts plus per-operation timeouts. The in-page
+ * comes from the effort budget plus per-operation timeouts. The in-page
  * extraction lives in a self-contained function so `page.evaluate` can
  * serialise it without losing module bindings.
  */
 import {
   BROWSER_SEARCH_ACCEPT_LANGUAGE,
   BROWSER_SEARCH_ENDPOINT,
-  BROWSER_SEARCH_MAX_PAGES,
   BROWSER_SEARCH_POLL_INTERVAL_MS,
   BROWSER_SEARCH_RESULTS_TIMEOUT_MS,
   BROWSER_SEARCH_USER_AGENT,
   BROWSER_SEARCH_VIEWPORT,
+  DDG_EFFORT_PAGES,
 } from "../constants";
 import {
   BROWSER_CALL_TIMEOUT_MS,
@@ -149,7 +149,6 @@ export interface BrowserSearchDeps {
   closeTimeoutMs?: number;
   resultsTimeoutMs?: number;
   pollIntervalMs?: number;
-  maxPages?: number;
 }
 
 /** Whether a browser was attempted, plus the search result it produced. */
@@ -163,7 +162,6 @@ interface BrowserRunOptions {
   navTimeoutMs: number;
   resultsTimeoutMs: number;
   pollIntervalMs: number;
-  maxPages: number;
 }
 
 const FRESHNESS_DF: Record<Freshness, string> = {
@@ -208,7 +206,6 @@ export async function searchViaBrowser(
     navTimeoutMs: deps.navTimeoutMs ?? BROWSER_NAV_TIMEOUT_MS,
     resultsTimeoutMs: deps.resultsTimeoutMs ?? BROWSER_SEARCH_RESULTS_TIMEOUT_MS,
     pollIntervalMs: deps.pollIntervalMs ?? BROWSER_SEARCH_POLL_INTERVAL_MS,
-    maxPages: deps.maxPages ?? BROWSER_SEARCH_MAX_PAGES,
   };
 
   const launchPromise = launch(deps.binding);
@@ -248,6 +245,7 @@ async function runBrowserSearch(
   await configurePage(page, options);
   await navigate(page, params, options);
 
+  const pageLimit = DDG_EFFORT_PAGES[params.effort];
   const results: SearchResultItem[] = [];
   const seen = new Set<string>();
 
@@ -268,20 +266,16 @@ async function runBrowserSearch(
       : failedBrowserResult("PARSE_FAILED", "could not parse the results page");
   }
 
-  appendResults(initial.extraction.results, params, seen, results);
+  appendResults(initial.extraction.results, seen, results);
   let current = initial.extraction;
   let pages = 1;
 
-  if (results.length >= params.maxResults) return { status: "ok", results };
+  // Confirmed exhaustion wins even on the first batch; reaching the effort
+  // budget with a continuation available is a normal `ok`.
+  if (!current.hasMore) return { status: "exhausted", results };
+  if (pages >= pageLimit) return { status: "ok", results };
 
   while (current.hasMore) {
-    if (pages >= options.maxPages) {
-      return interruptedOrFailed(
-        results,
-        makeError("PAGE_LIMIT", `stopped after ${options.maxPages} browser pages`),
-      );
-    }
-
     const before = current.results.length;
     let clicked: boolean;
     try {
@@ -326,12 +320,12 @@ async function runBrowserSearch(
       return interruptedOrFailed(results, makeError("UPSTREAM_ERROR", "browser pagination timed out"));
     }
 
-    const added = appendResults(next.results, params, seen, results);
-    // A click that produced no new unique results must not be retried forever.
-    if (added === 0) return { status: "exhausted", results };
+    // Duplicate URLs in an advancing batch are not exhaustion: effort, not a
+    // unique-result count, bounds the loop.
+    appendResults(next.results, seen, results);
     pages += 1;
-    if (results.length >= params.maxResults) return { status: "ok", results };
     if (!next.hasMore) return { status: "exhausted", results };
+    if (pages >= pageLimit) return { status: "ok", results };
     current = next;
   }
 
@@ -431,13 +425,10 @@ function evaluateExtraction(
 
 function appendResults(
   pageResults: SearchDomResult[],
-  params: SearchParams,
   seen: Set<string>,
   out: SearchResultItem[],
-): number {
-  let added = 0;
+): void {
   for (const result of pageResults) {
-    if (out.length >= params.maxResults) break;
     const normalized = normalizeResultUrl(result.href, BROWSER_SEARCH_ENDPOINT);
     if (normalized === null || seen.has(normalized.url)) continue;
     seen.add(normalized.url);
@@ -448,9 +439,7 @@ function appendResults(
       domain: normalized.domain,
       snippet: result.snippet,
     });
-    added += 1;
   }
-  return added;
 }
 
 function failedBrowserResult(code: ErrorCode, message: string): SearchResult {

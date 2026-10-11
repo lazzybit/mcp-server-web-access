@@ -1,16 +1,17 @@
 /**
  * DuckDuckGo HTML transport as a {@link SearchProvider}.
  *
- * Owns one complete search: pagination, a fixed dispatch spacing, and its own
- * persisted cooldown under `search/providers/v2/ddg-html/state`. A challenge or
- * any other failure ends the search immediately and hands the partial results
- * to the coordinator; there is no same-provider retry.
+ * Owns one complete search: pagination up to the effort budget, a fixed
+ * dispatch spacing, and its own persisted cooldown under
+ * `search/providers/v2/ddg-html/state`. A challenge or any other failure ends
+ * the search immediately and hands the partial results to the coordinator;
+ * there is no same-provider retry.
  */
 import {
   ATTEMPT_TIMEOUT_MS,
   COOLDOWN_MS,
+  DDG_EFFORT_PAGES,
   MAX_BODY_BYTES,
-  MAX_PAGES,
   PROVIDER_INTERVAL_MS,
   TRANSIENT_DELAY_MS,
 } from "../constants";
@@ -23,7 +24,7 @@ import {
 import type { FetchLike } from "../ddg/request";
 import { parsePage } from "../ddg/parse";
 import type { ParsedPage, ParsedResult } from "../ddg/parse";
-import { interruptedOrFailed, makeError } from "../types";
+import { makeError } from "../types";
 import type { AppEnv } from "../env";
 import type {
   ErrorCode,
@@ -50,7 +51,6 @@ export interface DdgHtmlDeps {
   attemptTimeoutMs: number;
   cooldownMs: number;
   transientDelayMs: number;
-  maxPages: number;
   logLevel: LogLevel;
 }
 
@@ -78,7 +78,6 @@ export function defaultHtmlDeps(env: AppEnv, clock: Clock = new RealClock()): Dd
     attemptTimeoutMs: ATTEMPT_TIMEOUT_MS,
     cooldownMs: COOLDOWN_MS,
     transientDelayMs: TRANSIENT_DELAY_MS,
-    maxPages: MAX_PAGES,
     logLevel: env.LOG_LEVEL ?? "info",
   };
 }
@@ -148,6 +147,7 @@ export class DdgHtmlSearchProvider implements SearchProvider {
    */
   async search(params: SearchParams): Promise<ProviderOutcome> {
     const startedAt = this.#now();
+    const pageLimit = DDG_EFFORT_PAGES[params.effort];
     const results: SearchResultItem[] = [];
     const seen = new Set<string>();
     let fields = initialFields(params);
@@ -172,16 +172,6 @@ export class DdgHtmlSearchProvider implements SearchProvider {
       }
 
       for (;;) {
-        if (pages >= this.#deps.maxPages) {
-          return finish({
-            kind: "done",
-            result: interruptedOrFailed(
-              results,
-              makeError("PAGE_LIMIT", `stopped after ${this.#deps.maxPages} pages`),
-            ),
-          });
-        }
-
         await this.#waitForPacing();
 
         // An admitted search can still find the cooldown active when pacing
@@ -219,12 +209,14 @@ export class DdgHtmlSearchProvider implements SearchProvider {
             }));
           case "results": {
             pages += 1;
-            mergeResults(outcome.page.results, seen, results, params.maxResults);
-            if (results.length >= params.maxResults) {
-              return finish({ kind: "done", result: { status: "ok", results } });
-            }
+            mergeResults(outcome.page.results, seen, results);
+            // Confirmed exhaustion wins even on the last allowed page; reaching
+            // the effort budget with a continuation available is a normal `ok`.
             if (outcome.page.next === null) {
               return finish({ kind: "done", result: { status: "exhausted", results } });
+            }
+            if (pages >= pageLimit) {
+              return finish({ kind: "done", result: { status: "ok", results } });
             }
             fields = outcome.page.next.fields;
             break;
@@ -371,11 +363,7 @@ export class DdgHtmlSearchProvider implements SearchProvider {
     const count = outcome.kind === "done"
       ? outcome.result.results.length
       : outcome.results.length;
-    const code = outcome.kind === "done"
-      ? outcome.result.status === "interrupted"
-        ? outcome.result.error.code
-        : undefined
-      : outcome.error.code;
+    const code = outcome.kind === "fallback" ? outcome.error.code : undefined;
     const level: LogLevel = status === "failed"
       ? "error"
       : status === "interrupted"
@@ -405,10 +393,8 @@ function mergeResults(
   pageResults: ParsedResult[],
   seen: Set<string>,
   out: SearchResultItem[],
-  maxResults: number,
 ): void {
   for (const result of pageResults) {
-    if (out.length >= maxResults) return;
     if (seen.has(result.url)) continue;
     seen.add(result.url);
     out.push({

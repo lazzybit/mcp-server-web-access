@@ -183,10 +183,10 @@ describe("clickMoreResults", () => {
 describe("buildBrowserSearchUrl", () => {
   it("encodes the query, region and freshness", () => {
     expect(
-      buildBrowserSearchUrl({ query: "hello world", maxResults: 5, region: "us-en" }),
+      buildBrowserSearchUrl({ query: "hello world", effort: "low", region: "us-en" }),
     ).toBe("https://duckduckgo.com/?q=hello+world&kl=us-en");
     expect(
-      buildBrowserSearchUrl({ query: "x", maxResults: 5, region: "wt-wt", freshness: "week" }),
+      buildBrowserSearchUrl({ query: "x", effort: "low", region: "wt-wt", freshness: "week" }),
     ).toBe("https://duckduckgo.com/?q=x&kl=wt-wt&df=w");
   });
 });
@@ -217,7 +217,7 @@ describe("searchViaBrowser", () => {
     );
 
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "medium", region: "wt-wt" },
       { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
     );
 
@@ -231,7 +231,7 @@ describe("searchViaBrowser", () => {
     expect(browser.closes).toBe(1);
   });
 
-  it("returns ok as soon as maxResults is reached", async () => {
+  it("completes at the effort limit with a continuation available", async () => {
     const browser = new FakeSearchBrowser(
       new FakeSearchPage([
         results(
@@ -240,19 +240,19 @@ describe("searchViaBrowser", () => {
             { href: "https://example.com/b" },
             { href: "https://example.com/c" },
           ],
-          false,
+          true,
         ),
       ]),
     );
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 2, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
     );
     expect(outcome.result.status).toBe("ok");
-    expect(outcome.result.results).toHaveLength(2);
+    expect(outcome.result.results).toHaveLength(3);
   });
 
-  it("stops at the page limit with partial results", async () => {
+  it("completes at the effort limit with partial pagination", async () => {
     const browser = new FakeSearchBrowser(
       new FakeSearchPage([
         results([{ href: "https://example.com/a" }], true),
@@ -260,21 +260,20 @@ describe("searchViaBrowser", () => {
       ]),
     );
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 10, region: "wt-wt" },
-      { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100, maxPages: 2 },
+      { query: "q", effort: "medium", region: "wt-wt" },
+      { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
     );
-    expect(outcome.result.status).toBe("interrupted");
+    expect(outcome.result.status).toBe("ok");
     expect(outcome.result.results.map((item) => item.url)).toEqual([
       "https://example.com/a",
       "https://example.com/b",
     ]);
-    expect("error" in outcome.result ? outcome.result.error.code : undefined).toBe("PAGE_LIMIT");
   });
 
   it("maps a challenge to PROVIDER_CHALLENGE", async () => {
     const browser = new FakeSearchBrowser(new FakeSearchPage([{ kind: "challenge" }]));
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
     );
     expect(outcome.result.status).toBe("failed");
@@ -284,7 +283,7 @@ describe("searchViaBrowser", () => {
   it("returns exhausted for a confirmed no-results page", async () => {
     const browser = new FakeSearchBrowser(new FakeSearchPage([{ kind: "no_results" }]));
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
     );
     expect(outcome.result).toEqual({ status: "exhausted", results: [] });
@@ -293,7 +292,7 @@ describe("searchViaBrowser", () => {
   it("times out an unparseable page as UPSTREAM_ERROR", async () => {
     const browser = new FakeSearchBrowser(new FakeSearchPage([{ kind: "unparseable" }]));
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, pollIntervalMs: 1, resultsTimeoutMs: 30 },
     );
     expect(outcome.result.status).toBe("failed");
@@ -317,7 +316,7 @@ describe("searchViaBrowser", () => {
       });
 
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: launcher, launchTimeoutMs: 10, closeTimeoutMs: 20 },
     );
     expect(outcome.result.status).toBe("failed");
@@ -332,7 +331,7 @@ describe("searchViaBrowser", () => {
       close: () => new Promise<void>(() => {}),
     };
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100, closeTimeoutMs: 20 },
     );
     expect(outcome.result.status).toBe("exhausted");
@@ -356,7 +355,7 @@ describe("searchViaBrowser", () => {
     };
     const browser: BrowserCapability = { newPage: async () => page, close: async () => {} };
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "low", region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, resultsTimeoutMs: 20 },
     );
     expect(outcome.result.status).toBe("failed");
@@ -383,7 +382,7 @@ describe("searchViaBrowser", () => {
     };
     const browser: BrowserCapability = { newPage: async () => page, close: async () => {} };
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "medium", region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, pollIntervalMs: 1, resultsTimeoutMs: 30 },
     );
     expect(outcome.result.status).toBe("interrupted");
@@ -391,16 +390,31 @@ describe("searchViaBrowser", () => {
     expect("error" in outcome.result ? outcome.result.error.code : undefined).toBe("UPSTREAM_ERROR");
   });
 
-  it("stops when a click produces no new results", async () => {
+  it("times out a click whose containers never advance", async () => {
     const same = results([{ href: "https://example.com/a" }], true);
     const browser = new FakeSearchBrowser(new FakeSearchPage([same, same]));
     const outcome = await searchViaBrowser(
-      { query: "q", maxResults: 5, region: "wt-wt" },
+      { query: "q", effort: "medium", region: "wt-wt" },
       { launch: async () => browser, callTimeoutMs: 20, pollIntervalMs: 1, resultsTimeoutMs: 30 },
     );
     expect(outcome.result.status).toBe("interrupted");
     expect(outcome.result.results).toHaveLength(1);
     expect("error" in outcome.result ? outcome.result.error.code : undefined).toBe("UPSTREAM_ERROR");
+  });
+
+  it("keeps paginating when a batch advances but only repeats URLs", async () => {
+    const browser = new FakeSearchBrowser(
+      new FakeSearchPage([
+        results([{ href: "https://example.com/a" }], true),
+        results([{ href: "https://example.com/a" }, { href: "https://example.com/a" }], true),
+      ]),
+    );
+    const outcome = await searchViaBrowser(
+      { query: "q", effort: "medium", region: "wt-wt" },
+      { launch: async () => browser, pollIntervalMs: 1, resultsTimeoutMs: 100 },
+    );
+    expect(outcome.result.status).toBe("ok");
+    expect(outcome.result.results.map((item) => item.url)).toEqual(["https://example.com/a"]);
   });
 });
 

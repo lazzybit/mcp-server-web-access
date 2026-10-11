@@ -4,36 +4,44 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import {
   DEFAULT_REGION,
+  DEFAULT_SEARCH_EFFORT,
   MAX_OUTPUT_BYTES,
   MAX_QUERY_LENGTH,
-  MAX_RESULTS_LIMIT,
 } from "./constants";
 import { registerFetchPageTool } from "./page/mcp";
 import type { PageDeps } from "./page/mcp";
 import { advertisedSchema, inputJsonSchemaOf } from "./tool-schema";
 import { makeError } from "./types";
-import type { SearchParams, SearchResult } from "./types";
+import type { SearchEffort, SearchParams, SearchResult } from "./types";
 
 export const SERVER_NAME = "mcp-server-web-access";
 export const SERVER_VERSION = "0.1.0";
 export const SEARCH_TOPIC_TOOL_NAME = "search_topic";
 
 export const SERVER_INSTRUCTIONS =
-  "Web access tools. Call search_topic with a query and the number of results " +
-  "you want; the server paginates and deduplicates internally and preserves " +
-  "partial results with an explicit status when interrupted. Call fetch_page " +
+  "Web access tools. Call search_topic with a query and an optional effort " +
+  "(low, medium or high; default low) that states how hard to search; the " +
+  "server paginates and deduplicates internally and preserves partial results " +
+  "with an explicit status when interrupted. Call fetch_page " +
   "with a URL to get the page's readable content as Markdown or plain text; " +
   "the server decides whether a JavaScript render is needed and returns the " +
   "full content untruncated.";
 
 export const SEARCH_TOPIC_DESCRIPTION =
-  "Search the web and return up to 50 structured results. The server selects a " +
-  "search provider, falls back to another when the current one is challenged " +
-  "or unavailable, paginates internally and deduplicates URLs; callers only " +
-  "specify how many results they want. Returns partial results with an explicit " +
-  "status when interrupted.";
+  "Search the web and return structured results. The server selects a search " +
+  "provider, falls back to another when the current one is challenged or " +
+  "unavailable, paginates internally and deduplicates URLs; callers pass an " +
+  "optional effort level (low, medium or high; default low) stating how " +
+  "intensely to search, not how many results to return. Returns partial " +
+  "results with an explicit status when interrupted.";
 
 export const REGION_PATTERN = /^([a-z]{2}-[a-z]{2}|wt-wt)$/;
+
+const EFFORT_VALUES = ["low", "medium", "high"] as const;
+
+function isEffort(value: unknown): value is SearchEffort {
+  return value === "low" || value === "medium" || value === "high";
+}
 
 /** Tool input contract. */
 export const webSearchInputSchema = z.object({
@@ -41,11 +49,7 @@ export const webSearchInputSchema = z.object({
     .string()
     .min(1, "query must not be empty")
     .max(MAX_QUERY_LENGTH, `query must be at most ${MAX_QUERY_LENGTH} characters`),
-  maxResults: z
-    .number()
-    .int("maxResults must be an integer")
-    .min(1, "maxResults must be at least 1")
-    .max(MAX_RESULTS_LIMIT, `maxResults must be at most ${MAX_RESULTS_LIMIT}`),
+  effort: z.enum(EFFORT_VALUES).optional(),
   region: z
     .string()
     .regex(REGION_PATTERN, "region must look like us-en or wt-wt")
@@ -89,7 +93,7 @@ export const webSearchOutputSchema = z.object({
     text: z.string(),
     region: z.string(),
     freshness: z.enum(["day", "week", "month", "year"]).optional(),
-    requested: z.number().int().nonnegative(),
+    effort: z.enum(EFFORT_VALUES),
   }),
   results: z.array(searchResultItemSchema),
   count: z.number().int().nonnegative(),
@@ -171,12 +175,21 @@ export async function runWebSearch(
   const normalized: Record<string, unknown> = { ...raw };
   if (typeof raw["query"] === "string") normalized["query"] = raw["query"].trim();
 
+  // A count target is no longer accepted, and no effort is inferred from it.
+  // The own-property check also rejects an explicitly supplied `undefined`.
+  if (Object.hasOwn(raw, "maxResults")) {
+    return invalidInputOutput(
+      raw,
+      "maxResults is no longer supported; pass effort (low, medium or high) instead",
+    );
+  }
+
   const parsed = webSearchInputSchema.safeParse(normalized);
   if (!parsed.success) return invalidInputOutput(raw, parsed.error);
 
   const params: SearchParams = {
     query: parsed.data.query,
-    maxResults: parsed.data.maxResults,
+    effort: parsed.data.effort ?? DEFAULT_SEARCH_EFFORT,
     region: parsed.data.region ?? DEFAULT_REGION,
     ...(parsed.data.freshness !== undefined ? { freshness: parsed.data.freshness } : {}),
   };
@@ -188,7 +201,7 @@ function toOutput(params: SearchParams, result: SearchResult): WebSearchOutput {
   const query: WebSearchOutput["query"] = {
     text: params.query,
     region: params.region,
-    requested: params.maxResults,
+    effort: params.effort,
   };
   if (params.freshness !== undefined) query.freshness = params.freshness;
 
@@ -214,24 +227,22 @@ function toOutput(params: SearchParams, result: SearchResult): WebSearchOutput {
 /** Builds a schema-valid response for rejected arguments. */
 export function invalidInputOutput(
   raw: Record<string, unknown>,
-  error: z.ZodError,
+  error: z.ZodError | string,
 ): WebSearchOutput {
   const query =
     typeof raw["query"] === "string" ? raw["query"].slice(0, MAX_QUERY_LENGTH) : "";
   const regionRaw = raw["region"];
   const region =
     typeof regionRaw === "string" && REGION_PATTERN.test(regionRaw) ? regionRaw : DEFAULT_REGION;
-  const maxRaw = raw["maxResults"];
-  const requested =
-    typeof maxRaw === "number" && Number.isFinite(maxRaw)
-      ? clamp(Math.trunc(maxRaw), 0, MAX_RESULTS_LIMIT)
-      : 0;
-  const message = error.issues
-    .map((issue) => `${issue.path.map(String).join(".") || "(root)"}: ${issue.message}`)
-    .join("; ");
+  const effort = isEffort(raw["effort"]) ? raw["effort"] : DEFAULT_SEARCH_EFFORT;
+  const message = typeof error === "string"
+    ? error
+    : error.issues
+        .map((issue) => `${issue.path.map(String).join(".") || "(root)"}: ${issue.message}`)
+        .join("; ");
 
   return {
-    query: { text: query, region, requested },
+    query: { text: query, region, effort },
     results: [],
     count: 0,
     truncated: false,
@@ -260,9 +271,9 @@ export function shrinkOutput(output: WebSearchOutput, maxBytes: number): WebSear
   if (byteLength(output) <= maxBytes) return output;
 
   const originallySuccessful = output.error === undefined;
-  const requested = output.query.requested;
+  const originalCount = output.results.length;
   const finalize = (candidate: WebSearchOutput): WebSearchOutput =>
-    finalizeReduction(candidate, originallySuccessful, requested);
+    finalizeReduction(candidate, originallySuccessful, originalCount);
   const fits = (candidate: WebSearchOutput): boolean =>
     byteLength(finalize(candidate)) <= maxBytes;
 
@@ -302,15 +313,15 @@ export function shrinkOutput(output: WebSearchOutput, maxBytes: number): WebSear
 function finalizeReduction(
   current: WebSearchOutput,
   originallySuccessful: boolean,
-  requested: number,
+  originalCount: number,
 ): WebSearchOutput {
   const count = current.results.length;
   const next: WebSearchOutput = { ...current, count, truncated: true };
-  if (originallySuccessful && count < requested) {
+  if (originallySuccessful && count < originalCount) {
     next.status = "interrupted";
     next.error = makeError(
       "OUTPUT_TRUNCATED",
-      `output reduced to ${count} of ${requested} requested results`,
+      `output reduced to ${count} results`,
     );
   }
   return next;
@@ -326,8 +337,4 @@ function byteLength(value: WebSearchOutput): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }

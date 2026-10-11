@@ -8,7 +8,7 @@ import { ManualClock } from "./manual-clock";
 
 describe("initialFields", () => {
   it("starts with q/b/kl", () => {
-    expect(initialFields({ query: "hello", maxResults: 5, region: "us-en" })).toEqual([
+    expect(initialFields({ query: "hello", effort: "low", region: "us-en" })).toEqual([
       ["q", "hello"],
       ["b", ""],
       ["kl", "us-en"],
@@ -27,7 +27,7 @@ describe("buildPageForm", () => {
         ["df", "y"],
         ["vqd", "1"],
       ],
-      { query: "x", maxResults: 5, region: "uk-en", freshness: "month" },
+      { query: "x", effort: "low", region: "uk-en", freshness: "month" },
     );
     expect(form.get("q")).toBe("x");
     expect(form.get("s")).toBe("25");
@@ -41,7 +41,7 @@ describe("buildPageForm", () => {
   it("omits df when no freshness is requested", () => {
     const form = buildPageForm([["q", "x"]], {
       query: "x",
-      maxResults: 5,
+      effort: "low",
       region: "us-en",
     });
     expect(form.has("df")).toBe(false);

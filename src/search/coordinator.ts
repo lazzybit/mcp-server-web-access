@@ -120,10 +120,10 @@ export class SearchCoordinator {
           tried.push(next.id);
           const outcome = await next.search(params);
           if (outcome.kind === "done") {
-            collect(merged, seen, outcome.result.results, params.maxResults);
+            collect(merged, seen, outcome.result.results);
             return this.#finalize(outcome.result, merged, params, startedAt, tried);
           }
-          collect(merged, seen, outcome.results, params.maxResults);
+          collect(merged, seen, outcome.results);
           lastError = outcome.error;
           continue;
         }
@@ -165,20 +165,13 @@ export class SearchCoordinator {
   }
 
   #finalize(
-    done: SearchResult,
+    done: Extract<SearchResult, { status: "ok" | "exhausted" }>,
     merged: SearchResultItem[],
     params: SearchParams,
     startedAt: number,
     tried: string[],
   ): SearchResult {
-    let result: SearchResult;
-    if (done.status === "interrupted") {
-      result = { status: "interrupted", results: merged, error: done.error };
-    } else if (merged.length >= params.maxResults) {
-      result = { status: "ok", results: merged };
-    } else {
-      result = { status: "exhausted", results: merged };
-    }
+    const result: SearchResult = { status: done.status, results: merged };
     this.#logSearch(result, params, startedAt, tried);
     return result;
   }
@@ -237,7 +230,7 @@ export class SearchCoordinator {
       event: "search_coordinator",
       status: result.status,
       count: result.results.length,
-      requested: params.maxResults,
+      effort: params.effort,
       providers: tried,
       elapsedMs: Math.max(0, this.#now() - startedAt),
       ...(result.status === "interrupted" || result.status === "failed"
@@ -258,10 +251,8 @@ function collect(
   out: SearchResultItem[],
   seen: Set<string>,
   incoming: SearchResultItem[],
-  maxResults: number,
 ): void {
   for (const item of incoming) {
-    if (out.length >= maxResults) return;
     if (seen.has(item.url)) continue;
     seen.add(item.url);
     out.push({

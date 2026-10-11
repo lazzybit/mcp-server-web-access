@@ -22,7 +22,7 @@ function pageStub(): PageDeps {
 
 function output(overrides: Partial<WebSearchOutput> = {}): WebSearchOutput {
   return {
-    query: { text: "x", region: "wt-wt", requested: 3 },
+    query: { text: "x", region: "wt-wt", effort: "low" },
     results: [
       { rank: 1, title: "A", url: "https://a.example/", domain: "a.example", snippet: "sa" },
     ],
@@ -38,7 +38,7 @@ function utf8Bytes(value: unknown): number {
 }
 
 describe("runWebSearch", () => {
-  it("forwards validated params with defaults", async () => {
+  it("defaults effort to low and forwards an explicit effort", async () => {
     const seen: SearchParams[] = [];
     const deps = {
       search: async (params: SearchParams): Promise<SearchResult> => {
@@ -46,13 +46,29 @@ describe("runWebSearch", () => {
         return { status: "ok", results: [] };
       },
     };
-    await runWebSearch(deps, { query: "  hello  ", maxResults: 5 });
-    expect(seen).toEqual([{ query: "hello", maxResults: 5, region: "wt-wt" }]);
+    await runWebSearch(deps, { query: "  hello  " });
+    await runWebSearch(deps, { query: "world", effort: "high" });
+    expect(seen).toEqual([
+      { query: "hello", effort: "low", region: "wt-wt" },
+      { query: "world", effort: "high", region: "wt-wt" },
+    ]);
+  });
+
+  it("rejects a legacy maxResults argument without translating it", async () => {
+    const deps = { search: async (): Promise<SearchResult> => ({ status: "ok", results: [] }) };
+    const result = await runWebSearch(deps, { query: "x", maxResults: 3 });
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("INVALID_INPUT");
+    expect(result.query.effort).toBe("low");
+
+    const explicitUndefined = await runWebSearch(deps, { query: "x", maxResults: undefined });
+    expect(explicitUndefined.status).toBe("failed");
+    expect(explicitUndefined.error?.code).toBe("INVALID_INPUT");
   });
 
   it("returns a structured INVALID_INPUT result", async () => {
     const deps = { search: async (): Promise<SearchResult> => ({ status: "ok", results: [] }) };
-    const result = await runWebSearch(deps, { query: "", maxResults: 0 });
+    const result = await runWebSearch(deps, { query: "", effort: "extreme" });
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("INVALID_INPUT");
     expect(toCallToolResult(result).isError).toBe(true);
@@ -79,7 +95,7 @@ describe("toCallToolResult", () => {
 describe("shrinkOutput", () => {
   it("clears snippets before dropping results", () => {
     const value = output({
-      query: { text: "x", region: "wt-wt", requested: 1 },
+      query: { text: "x", region: "wt-wt", effort: "low" },
       results: [
         {
           rank: 1,
@@ -99,7 +115,7 @@ describe("shrinkOutput", () => {
     expect(utf8Bytes(shrunk)).toBeLessThanOrEqual(400);
   });
 
-  it("becomes interrupted with OUTPUT_TRUNCATED when it drops below requested", () => {
+  it("becomes interrupted with OUTPUT_TRUNCATED when it drops results from ok", () => {
     const results = Array.from({ length: 5 }, (_, index) => ({
       rank: index + 1,
       title: `Result ${index} `.repeat(20),
@@ -108,13 +124,34 @@ describe("shrinkOutput", () => {
       snippet: `snippet ${index} `.repeat(30),
     }));
     const value = output({
-      query: { text: "x", region: "wt-wt", requested: 5 },
+      query: { text: "x", region: "wt-wt", effort: "low" },
       results,
       count: results.length,
     });
     const shrunk = shrinkOutput(value, 900);
     expect(shrunk.count).toBeLessThan(5);
     expect(shrunk.truncated).toBe(true);
+    expect(shrunk.status).toBe("interrupted");
+    expect(shrunk.error?.code).toBe("OUTPUT_TRUNCATED");
+    expect(utf8Bytes(shrunk)).toBeLessThanOrEqual(900);
+  });
+
+  it("becomes interrupted with OUTPUT_TRUNCATED when it drops results from exhausted", () => {
+    const results = Array.from({ length: 5 }, (_, index) => ({
+      rank: index + 1,
+      title: `Result ${index} `.repeat(20),
+      url: `https://example.com/${index}`,
+      domain: "example.com",
+      snippet: `snippet ${index} `.repeat(30),
+    }));
+    const value = output({
+      query: { text: "x", region: "wt-wt", effort: "low" },
+      results,
+      count: results.length,
+      status: "exhausted",
+    });
+    const shrunk = shrinkOutput(value, 900);
+    expect(shrunk.count).toBeLessThan(5);
     expect(shrunk.status).toBe("interrupted");
     expect(shrunk.error?.code).toBe("OUTPUT_TRUNCATED");
     expect(utf8Bytes(shrunk)).toBeLessThanOrEqual(900);
@@ -129,7 +166,7 @@ describe("shrinkOutput", () => {
       snippet: "\u30b9\u30cb\u30da\u30c3\u30c8\ud83d\ude00".repeat(40),
     }));
     const value = output({
-      query: { text: "x", region: "wt-wt", requested: 8 },
+      query: { text: "x", region: "wt-wt", effort: "high" },
       results,
       count: results.length,
     });
@@ -140,7 +177,7 @@ describe("shrinkOutput", () => {
 
   it("preserves an upstream error", () => {
     const value = output({
-      query: { text: "x", region: "wt-wt", requested: 5 },
+      query: { text: "x", region: "wt-wt", effort: "low" },
       results: [
         { rank: 1, title: "A".repeat(300), url: "https://a.example/", domain: "a.example", snippet: "s".repeat(300) },
       ],
@@ -163,12 +200,12 @@ describe("advertised input schema", () => {
       io: "input",
     }) as { properties?: Record<string, unknown>; required?: string[] };
     expect(Object.keys(json.properties ?? {}).sort()).toEqual([
+      "effort",
       "freshness",
-      "maxResults",
       "query",
       "region",
     ]);
-    expect(json.required).toEqual(["query", "maxResults"]);
+    expect(json.required).toEqual(["query"]);
   });
 });
 
@@ -197,7 +234,7 @@ describe("MCP server", () => {
 
       const result = await client.callTool({
         name: "search_topic",
-        arguments: { query: "alpha", maxResults: 1 },
+        arguments: { query: "alpha", effort: "low" },
       });
       expect(result.isError).toBeFalsy();
       expect(result.structuredContent).toMatchObject({ status: "ok", count: 1 });
@@ -217,7 +254,27 @@ describe("MCP server", () => {
     try {
       const result = await client.callTool({
         name: "search_topic",
-        arguments: { query: "", maxResults: 999 },
+        arguments: { query: "", effort: "extreme" },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        status: "failed",
+        error: { code: "INVALID_INPUT" },
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rejects a legacy maxResults argument with INVALID_INPUT", async () => {
+    const { client, server } = await connect({
+      search: async (): Promise<SearchResult> => ({ status: "ok", results: [] }),
+    });
+    try {
+      const result = await client.callTool({
+        name: "search_topic",
+        arguments: { query: "alpha", maxResults: 3 },
       });
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({

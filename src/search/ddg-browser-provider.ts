@@ -139,11 +139,8 @@ export class DdgBrowserSearchProvider implements SearchProvider {
       };
     }
 
-    // `ok` and `exhausted` are complete. A page limit is bounded and complete.
+    // `ok` and `exhausted` are complete outcomes.
     if (result.status === "ok" || result.status === "exhausted") {
-      return { kind: "done", result };
-    }
-    if (result.status === "interrupted" && result.error.code === "PAGE_LIMIT") {
       return { kind: "done", result };
     }
     // Challenge / other failure (including a mid-pagination one with usable
@@ -199,11 +196,7 @@ export class DdgBrowserSearchProvider implements SearchProvider {
     const count = outcome.kind === "done"
       ? outcome.result.results.length
       : outcome.results.length;
-    const code = outcome.kind === "done"
-      ? outcome.result.status === "interrupted"
-        ? outcome.result.error.code
-        : undefined
-      : outcome.error.code;
+    const code = outcome.kind === "fallback" ? outcome.error.code : undefined;
     const level: LogLevel = status === "failed"
       ? "error"
       : status === "interrupted"

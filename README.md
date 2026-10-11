@@ -94,14 +94,14 @@ The Worker re-verifies the injected `Cf-Access-Jwt-Assertion` (signature, `iss`,
 Input:
 
 ```ts
-{ query: string /* trim 1..512 */, maxResults: 1..50, region?: "xx-xx" | "wt-wt", freshness?: "day"|"week"|"month"|"year" }
+{ query: string /* trim 1..512 */, effort?: "low"|"medium"|"high" /* default low */, region?: "xx-xx" | "wt-wt", freshness?: "day"|"week"|"month"|"year" }
 ```
 
 Output (`structuredContent` and `content[0].text` are the same object):
 
 ```ts
 {
-  query: { text; region; freshness?; requested },
+  query: { text; region; freshness?; effort },
   results: { rank; title; url; domain; snippet }[],
   count, truncated,
   status: "ok" | "exhausted" | "interrupted" | "failed",
@@ -110,16 +110,20 @@ Output (`structuredContent` and `content[0].text` are the same object):
 ```
 
 `isError` is true only for `failed`. Invalid arguments return a structured
-`INVALID_INPUT` result. Outputs over 256 KiB are shrunk (snippets, then strings,
-then results); an existing upstream error is preserved.
+`INVALID_INPUT` result, and a supplied `maxResults` (replaced by `effort`) is
+rejected the same way rather than translated. Outputs over 256 KiB are shrunk
+(snippets, then strings, then results); an existing upstream error is preserved.
 
 Provider selection: `SearchService` owns an ordered provider list — `ddg-html`
 always, and `ddg-browser` when `BROWSER_ENABLED !== "false"` and the `BROWSER`
 binding exists. For each complete search the coordinator tries the first ready,
 untried provider; on a challenge or any other failure it moves to the next
-ready provider within the same search, carrying over any partial results. Each
-provider owns its pagination, spacing, failure state and cooldown under its own
-storage namespace:
+ready provider within the same search, carrying over any partial results. `effort` states search intensity, not a
+result-count target: both DDG providers read it as an amount of search work —
+currently up to 1/2/3 result pages or batches including the initial load for
+`low`/`medium`/`high` — and may finish earlier when they confirm exhaustion.
+Each provider owns its pagination, spacing, failure state and cooldown under its
+own storage namespace:
 
 - `ddg-html` (`search/providers/v2/ddg-html/state`): a fixed 5 s minimum between
 dispatch starts, across pagination and consecutive searches. A challenge (or
@@ -166,15 +170,18 @@ soonest recovering provider when the remainder is at most 10 s (`10_000` waits,
 `10_001` does not), at most once per provider, and never while another provider
 is usable. After that bounded fallback the search is `interrupted` with the
 retained partial results, or `failed` + `NO_SEARCH_PROVIDER_AVAILABLE` with
-`retryAfterMs` set to the minimum known provider recovery. `ok`, `exhausted`
-(including zero matches) and `PAGE_LIMIT` are complete outcomes and stop the
-fallback; a `PAGE_LIMIT` surfaces as `interrupted`.
+`retryAfterMs` set to the minimum known provider recovery. `ok` and `exhausted` (including zero
+matches) are complete outcomes and stop the fallback. `ok` means the provider
+completed its effort behavior — more results may still exist — while `exhausted`
+means the provider confirmed no further results. `PAGE_LIMIT` remains in the wire
+schema as a legacy code but is no longer emitted by any path.
 
 The `ddg-browser` provider drives the JavaScript `duckduckgo.com` site with the
 desktop Chrome User-Agent, viewport and `accept-language`, and paginates by
-clicking the text-matched `More results` button up to `MAX_PAGES` batches. URLs
+clicking the text-matched `More results` button up to its effort budget. URLs
 are normalized and deduplicated across batches through the same
-`normalizeResultUrl`.
+`normalizeResultUrl`; a batch that only repeats known URLs is not exhaustion, so
+pagination continues until the budget or a confirmed last page.
 
 ### `fetch_page`
 
@@ -314,7 +321,7 @@ decision path fails over to static HTML; use a remote-bindings setup
 - `search_topic`: one provider line per attempt (`event: "search_provider"`,
   with provider id, status, count, pages, dispatches, elapsed time and error
   code) plus one coordinator line per search (`event: "search_coordinator"`,
-  with status, count, requested, the providers tried, elapsed time and error
+  with status, count, effort, the providers tried, elapsed time and error
   info).
 - `fetch_page`: one JSON line per call (`event: "fetch_page"`) with status,
   rendered, extraction, format, decision source/model/needsRender, `renderMs`,

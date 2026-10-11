@@ -16,6 +16,7 @@ import type {
   PageCapability,
 } from "../../src/browser/launcher";
 import type { SearchResult } from "../../src/types";
+import type { SearchParams } from "../../src/types";
 import { ManualClock, flushMicrotasks } from "./manual-clock";
 
 function doneOf(outcome: ProviderOutcome): SearchResult {
@@ -109,7 +110,7 @@ function deps(
   };
 }
 
-const REQUEST = { query: "x", maxResults: 5, region: "wt-wt" };
+const REQUEST: SearchParams = { query: "x", effort: "low", region: "wt-wt" };
 
 describe("DdgBrowserSearchProvider", () => {
   it("maps exhausted and ok browser results to done", async () => {
@@ -134,19 +135,19 @@ describe("DdgBrowserSearchProvider", () => {
           browserFor(
             results(
               [{ href: "https://a.example/" }, { href: "https://b.example/" }],
-              false,
+              true,
             ),
           ),
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
       }),
     );
-    const okResult = doneOf(await okProvider.search({ ...REQUEST, maxResults: 2 }));
+    const okResult = doneOf(await okProvider.search({ ...REQUEST }));
     expect(okResult.status).toBe("ok");
     expect(okResult.results).toHaveLength(2);
   });
 
-  it("maps a page limit to a complete interrupted result", async () => {
+  it("passes an effort-limit ok through as a complete result", async () => {
     const clock = new ManualClock();
     const storage = new MemoryStorage();
     const provider = new DdgBrowserSearchProvider(
@@ -156,14 +157,12 @@ describe("DdgBrowserSearchProvider", () => {
           browserFor(results([{ href: "https://a.example/" }], true)),
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
-        maxPages: 1,
       }),
     );
 
     const result = doneOf(await provider.search({ ...REQUEST }));
-    expect(result.status).toBe("interrupted");
-    if (result.status !== "interrupted") return;
-    expect(result.error.code).toBe("PAGE_LIMIT");
+    expect(result.status).toBe("ok");
+    expect(result.results).toHaveLength(1);
   });
 
   it("opens a challenge cooldown and returns a fallback", async () => {

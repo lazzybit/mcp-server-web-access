@@ -78,10 +78,10 @@ describe("MCP handler", () => {
 
       const result = await client.callTool({
         name: "search_topic",
-        arguments: { query: "test query", maxResults: 2 },
+        arguments: { query: "test query", effort: "low" },
       });
       expect(result.isError).toBeFalsy();
-      expect(result.structuredContent).toMatchObject({ status: "ok", count: 2 });
+      expect(result.structuredContent).toMatchObject({ status: "ok", count: 10 });
     } finally {
       await client.close();
     }
@@ -93,7 +93,7 @@ describe("MCP handler", () => {
     try {
       const result = await client.callTool({
         name: "search_topic",
-        arguments: { query: "", maxResults: 1 },
+        arguments: { query: "", effort: "low" },
       });
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({

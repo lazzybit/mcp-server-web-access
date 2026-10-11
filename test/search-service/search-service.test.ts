@@ -121,10 +121,10 @@ describe("SearchService", () => {
         intervalMs: 0,
       });
 
-      return instance.search({ query: "x", maxResults: 3, region: "wt-wt" });
+      return instance.search({ query: "x", effort: "medium", region: "wt-wt" });
     });
 
-    expect(result.status).toBe("ok");
+    expect(result.status).toBe("exhausted");
     expect(result.results.map((item) => item.url)).toEqual([
       "https://a.example/",
       "https://b.example/",
@@ -145,11 +145,11 @@ describe("SearchService", () => {
         cooldownMs: 60_000,
       });
 
-      const challenged = await instance.search({ query: "x", maxResults: 1, region: "wt-wt" });
+      const challenged = await instance.search({ query: "x", effort: "low", region: "wt-wt" });
       const stored = await state.storage.get<{ v: number; nextRetryAt: number }>(
         DDG_HTML_STATE_KEY,
       );
-      const immediate = await instance.search({ query: "y", maxResults: 1, region: "wt-wt" });
+      const immediate = await instance.search({ query: "y", effort: "low", region: "wt-wt" });
       return { challenged, stored, immediate };
     });
 
@@ -181,7 +181,7 @@ describe("SearchService", () => {
         resultsTimeoutMs: 100,
       });
 
-      const result = await instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
+      const result = await instance.search({ query: "x", effort: "low", region: "wt-wt" });
       return { result, htmlNextRetryAt: instance.getNextRetryAt(), browserNextRetryAt: instance.getBrowserNextRetryAt() };
     });
 
@@ -212,7 +212,7 @@ describe("SearchService", () => {
           throw new Error("no browser available");
         },
       });
-      await instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
+      await instance.search({ query: "x", effort: "low", region: "wt-wt" });
 
       return {
         html: await durableState.storage.get(DDG_HTML_STATE_KEY),
@@ -243,7 +243,7 @@ describe("SearchService", () => {
           throw new Error("no browser available");
         },
       });
-      return instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
+      return instance.search({ query: "x", effort: "low", region: "wt-wt" });
     });
 
     expect(outcome.status).toBe("failed");
@@ -253,7 +253,7 @@ describe("SearchService", () => {
     expect(state.launches).toBe(1);
   });
 
-  it("returns partial browser results as interrupted", async () => {
+  it("returns effort-limit browser results as ok", async () => {
     const clock = new ManualClock();
     const state: FakeBrowserState = { closes: 0, launches: 0 };
     const stub = freshStub();
@@ -270,14 +270,12 @@ describe("SearchService", () => {
         launch: browserLauncher(browserResult("https://example.com/p", true), state),
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
-        maxPages: 1,
       });
-      return instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
+      return instance.search({ query: "x", effort: "low", region: "wt-wt" });
     });
 
-    expect(outcome.status).toBe("interrupted");
+    expect(outcome.status).toBe("ok");
     expect(outcome.results).toHaveLength(1);
-    expect(codeOf(outcome)).toBe("PAGE_LIMIT");
   });
 
   it("continues the FIFO after a failed search", async () => {
@@ -302,8 +300,8 @@ describe("SearchService", () => {
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
       });
-      const first = instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
-      const second = instance.search({ query: "y", maxResults: 5, region: "wt-wt" });
+      const first = instance.search({ query: "x", effort: "low", region: "wt-wt" });
+      const second = instance.search({ query: "y", effort: "low", region: "wt-wt" });
       const [firstResult, secondResult] = await drive(clock, Promise.all([first, second]));
       return { first: firstResult, second: secondResult };
     });
@@ -340,8 +338,8 @@ describe("SearchService", () => {
         pollIntervalMs: 1,
         resultsTimeoutMs: 100,
       });
-      const first = instance.search({ query: "x", maxResults: 5, region: "wt-wt" });
-      const second = instance.search({ query: "y", maxResults: 5, region: "wt-wt" });
+      const first = instance.search({ query: "x", effort: "low", region: "wt-wt" });
+      const second = instance.search({ query: "y", effort: "low", region: "wt-wt" });
       await flushMicrotasks();
       const launchesBeforeRelease = state.launches;
       releaseFirst();
