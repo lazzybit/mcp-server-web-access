@@ -1,0 +1,2 @@
+- ProviderAvailability and sum type
+- how to pick up result after a provider failed, strategy
